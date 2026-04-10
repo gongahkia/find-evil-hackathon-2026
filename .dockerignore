@@ -1,0 +1,17 @@
+.claude
+.git
+.github
+.mypy_cache
+.piranesi-trace.jsonl
+.pytest_cache
+.ruff_cache
+.venv
+__pycache__/
+asset
+dist
+docs
+eval
+examples
+piranesi-output
+tests
+workspace
