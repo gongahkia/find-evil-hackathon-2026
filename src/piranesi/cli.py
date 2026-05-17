@@ -22,7 +22,7 @@ import typer
 from pydantic import BaseModel, ValidationError
 
 from piranesi import __version__
-from piranesi.adapters import parse_external_tool_file
+from piranesi.adapters import NmapParseError, parse_external_tool_file, parse_nmap_xml_file
 from piranesi.audit import append_audit_event
 from piranesi.config import ConfigError, PiranesiConfig, load_config
 from piranesi.detect import (
@@ -144,6 +144,15 @@ from piranesi.pipeline import (
     run_pipeline,
 )
 from piranesi.report import launch_compliance_tui, print_compliance_report, render_attestation
+from piranesi.report.pentest import (
+    PdfBackend,
+    ReportRenderError,
+    build_pentest_report,
+    render_report_artifact,
+)
+from piranesi.report.pentest import (
+    ReportFormat as PentestReportFormat,
+)
 from piranesi.report.renderer import (
     CandidateReportFinding,
     CombinedFinding,
@@ -157,9 +166,21 @@ from piranesi.report.renderer import (
 )
 from piranesi.report.trends import build_trend_report, render_terminal_trends, write_trend_report
 from piranesi.report.tui import display_report
+from piranesi.retest import (
+    RetestError,
+    append_retest_audit,
+    compare_workspaces,
+    write_retest_output,
+)
 from piranesi.scaffold import scaffold_project
 from piranesi.scan.monorepo import detect_monorepo_manifest, select_packages
 from piranesi.schema import SchemaExportError, write_schema
+from piranesi.signing import (
+    SigningError,
+    sign_workspace,
+    verification_result_payload,
+    verify_workspace,
+)
 from piranesi.support import SupportBundleOptions, create_support_bundle
 from piranesi.threat import build_threat_model
 from piranesi.trace import TraceBudgetExceededError, TraceWriter
@@ -175,6 +196,22 @@ from piranesi.verify import (
     write_target_profile,
 )
 from piranesi.watch import WatchDependencyError, WatchModeError, run_watch_mode
+from piranesi.workspace import (
+    FINDINGS_FILE,
+    AuditEvent,
+    EngagementMetadata,
+    WorkspaceError,
+    copy_tool_input,
+    create_workspace,
+    file_sha256,
+    load_workspace,
+    upsert_findings,
+    utc_now,
+    workspace_path,
+)
+from piranesi.workspace import (
+    append_audit_event as append_workspace_audit_event,
+)
 
 _RUN_HELP = """Run the compatibility source-code security pipeline.
 
@@ -249,6 +286,11 @@ intel_app = typer.Typer(
     help="Ingest and normalize offline external intelligence snapshots.",
     no_args_is_help=True,
 )
+ingest_app = typer.Typer(
+    add_completion=False,
+    help="Ingest pentest tool outputs into an engagement workspace.",
+    no_args_is_help=True,
+)
 fleet_app = typer.Typer(
     add_completion=False,
     help="Assess and summarize multiple host evidence bundles.",
@@ -318,6 +360,7 @@ app.add_typer(compliance_app, name="compliance", hidden=True)
 app.add_typer(hook_app, name="hook", hidden=True)
 app.add_typer(eval_app, name="eval", hidden=True)
 app.add_typer(intel_app, name="intel", hidden=True)
+app.add_typer(ingest_app, name="ingest")
 app.add_typer(fleet_app, name="fleet")
 app.add_typer(container_app, name="container")
 app.add_typer(k8s_app, name="k8s")
@@ -2313,6 +2356,337 @@ def main(
 @app.command("version")
 def version_command() -> None:
     typer.echo(f"piranesi {__version__}")
+
+
+@ingest_app.command("init", help="Initialize or update a pentest engagement workspace.")
+def ingest_init_command(
+    workspace: Annotated[
+        Path,
+        typer.Option(
+            "--workspace",
+            "-w",
+            dir_okay=True,
+            file_okay=False,
+            help="Workspace directory to create or update.",
+        ),
+    ] = Path("piranesi-workspace"),
+    client: Annotated[
+        str | None,
+        typer.Option("--client", help="Client name to store in workspace metadata."),
+    ] = None,
+    project: Annotated[
+        str | None,
+        typer.Option("--project", help="Project or engagement name to store in metadata."),
+    ] = None,
+    scope: Annotated[
+        list[str] | None,
+        typer.Option("--scope", help="In-scope target or asset; repeatable."),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the initialized workspace metadata as JSON."),
+    ] = False,
+) -> None:
+    engagement = EngagementMetadata(client=client, project=project, scope=scope or [])
+    try:
+        state = create_workspace(workspace, engagement=engagement)
+    except WorkspaceError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    payload = {
+        "workspace": str(state.root),
+        "schema_version": state.workspace.schema_version,
+        "findings": len(state.findings.findings),
+        "tool_inputs": len(state.workspace.tool_inputs),
+    }
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        typer.echo(f"Initialized workspace: {state.root}")
+
+
+@ingest_app.command("nmap", help="Ingest real nmap XML into a pentest workspace.")
+def ingest_nmap_command(
+    input_path: Annotated[
+        Path,
+        typer.Option(
+            "--input",
+            "-i",
+            exists=False,
+            dir_okay=False,
+            file_okay=True,
+            help="Real nmap XML export to ingest.",
+        ),
+    ],
+    workspace: Annotated[
+        Path,
+        typer.Option(
+            "--workspace",
+            "-w",
+            dir_okay=True,
+            file_okay=False,
+            help="Workspace directory to create or update.",
+        ),
+    ] = Path("piranesi-workspace"),
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print ingest summary as JSON."),
+    ] = False,
+) -> None:
+    if not input_path.is_file():
+        typer.echo(f"error: input file does not exist: {input_path}", err=True)
+        raise typer.Exit(code=2)
+
+    try:
+        state = create_workspace(workspace)
+        state, record = copy_tool_input(state, tool="nmap", input_path=input_path)
+        raw_input_path = workspace_path(state.root, record.raw_path, allowed_roots=("raw",))
+        parse_result = parse_nmap_xml_file(
+            raw_input_path,
+            input_sha256=record.sha256,
+            raw_path=record.raw_path,
+        )
+        state, record = copy_tool_input(
+            state,
+            tool="nmap",
+            input_path=input_path,
+            metadata=parse_result.metadata,
+        )
+        before_ids = {finding.id for finding in state.findings.findings}
+        incoming_ids = {finding.id for finding in parse_result.findings}
+        state = upsert_findings(state, parse_result.findings)
+        output_digest = file_sha256(state.root / FINDINGS_FILE)
+        summary = {
+            "tool": "nmap",
+            "created": len(incoming_ids - before_ids),
+            "updated": len(incoming_ids & before_ids),
+            "findings": len(parse_result.findings),
+            "warnings": parse_result.warnings,
+            "input_record": record.id,
+        }
+        append_workspace_audit_event(
+            state,
+            AuditEvent(
+                timestamp=utc_now(),
+                command="ingest nmap",
+                input_path=record.raw_path,
+                input_sha256=record.sha256,
+                output_path=FINDINGS_FILE,
+                output_sha256=output_digest,
+                summary=summary,
+            ),
+        )
+    except (WorkspaceError, NmapParseError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    if json_output:
+        typer.echo(json.dumps(summary, indent=2, sort_keys=True))
+    else:
+        warning_count = len(parse_result.warnings)
+        typer.echo(
+            "Ingested nmap XML: "
+            f"{summary['findings']} findings "
+            f"({summary['created']} created, {summary['updated']} updated, "
+            f"{warning_count} warnings)"
+        )
+
+
+@app.command("report", help="Generate pentest report artifacts from a workspace.")
+def pentest_report_command(
+    workspace: Annotated[
+        Path,
+        typer.Option(
+            "--workspace",
+            "-w",
+            dir_okay=True,
+            file_okay=False,
+            help="Workspace directory to render.",
+        ),
+    ] = Path("piranesi-workspace"),
+    output_format: Annotated[
+        PentestReportFormat,
+        typer.Option("--format", "-f", help="Report artifact format."),
+    ] = "md",
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            dir_okay=True,
+            file_okay=False,
+            help="Directory for report artifacts. Defaults to workspace/reports.",
+        ),
+    ] = None,
+    pdf_backend: Annotated[
+        PdfBackend,
+        typer.Option("--pdf-backend", help="PDF backend used when --format pdf."),
+    ] = "weasyprint",
+    redact_sensitive_evidence: Annotated[
+        bool,
+        typer.Option(
+            "--redact-sensitive-evidence/--include-sensitive-evidence",
+            help="Redact evidence snippets marked sensitive in the workspace.",
+        ),
+    ] = True,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print artifact metadata as JSON."),
+    ] = False,
+) -> None:
+    try:
+        state = load_workspace(workspace)
+        output_dir = output or workspace_path(state.root, "reports", allowed_roots=("reports",))
+        report_model = build_pentest_report(
+            state,
+            redact_sensitive_evidence=redact_sensitive_evidence,
+        )
+        artifact_path = render_report_artifact(
+            report_model,
+            output_dir=output_dir,
+            output_format=output_format,
+            pdf_backend=pdf_backend,
+        )
+    except (WorkspaceError, ReportRenderError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    payload = {
+        "format": output_format,
+        "pdf_backend": pdf_backend if output_format == "pdf" else None,
+        "path": str(artifact_path),
+        "sha256": file_sha256(artifact_path),
+    }
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        typer.echo(f"report: {artifact_path}")
+
+
+@app.command("sign", help="Create or verify a local chain-of-custody manifest.")
+def sign_command(
+    workspace: Annotated[
+        Path,
+        typer.Option(
+            "--workspace",
+            "-w",
+            dir_okay=True,
+            file_okay=False,
+            help="Workspace directory to sign or verify.",
+        ),
+    ] = Path("piranesi-workspace"),
+    verify: Annotated[
+        bool,
+        typer.Option("--verify", help="Verify the latest manifest instead of creating one."),
+    ] = False,
+    manifest: Annotated[
+        Path | None,
+        typer.Option(
+            "--manifest",
+            dir_okay=False,
+            file_okay=True,
+            help="Specific manifest to verify. Defaults to latest signatures/manifest-*.json.",
+        ),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print manifest or verification summary as JSON."),
+    ] = False,
+) -> None:
+    try:
+        if verify:
+            result = verify_workspace(workspace, manifest_path=manifest)
+            payload = verification_result_payload(result)
+            if json_output:
+                typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+            else:
+                if result.ok:
+                    typer.echo(f"manifest verified: {result.manifest_path}")
+                else:
+                    typer.echo(f"manifest verification failed: {result.manifest_path}")
+                    for failure in result.failures:
+                        typer.echo(
+                            f"- {failure.path}: {failure.message} "
+                            f"(expected={failure.expected_sha256}, "
+                            f"actual={failure.actual_sha256})"
+                        )
+            if not result.ok:
+                raise typer.Exit(code=1)
+            return
+
+        manifest_model, manifest_path = sign_workspace(workspace)
+    except SigningError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    payload = {
+        "manifest_id": manifest_model.manifest_id,
+        "path": str(manifest_path),
+        "artifacts": len(manifest_model.artifacts),
+        "audit_events": len(manifest_model.audit_chain),
+        "sha256": file_sha256(manifest_path),
+    }
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        typer.echo(f"manifest: {manifest_path}")
+
+
+@app.command("retest", help="Compare two workspaces and classify finding lifecycle status.")
+def retest_command(
+    baseline: Annotated[
+        Path,
+        typer.Option(
+            "--baseline",
+            dir_okay=True,
+            file_okay=False,
+            help="Baseline workspace directory.",
+        ),
+    ],
+    current: Annotated[
+        Path,
+        typer.Option(
+            "--current",
+            dir_okay=True,
+            file_okay=False,
+            help="Current workspace directory.",
+        ),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option(
+            "--output",
+            "-o",
+            dir_okay=False,
+            file_okay=True,
+            help="Retest output path. Use .json or .md.",
+        ),
+    ] = Path("retest.json"),
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print retest summary as JSON."),
+    ] = False,
+) -> None:
+    try:
+        result = compare_workspaces(baseline, current)
+        output_path = write_retest_output(result, output)
+        current_state = load_workspace(current)
+        append_retest_audit(current_state, result, output_path)
+    except (WorkspaceError, RetestError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    payload = {
+        "path": str(output_path),
+        "sha256": file_sha256(output_path),
+        "summary": result.summary,
+        "ambiguous": len(result.ambiguous_matches),
+    }
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        typer.echo(f"retest: {output_path}")
 
 
 @app.command(help="Print the shortest deterministic path to a useful first host report.")
@@ -4502,8 +4876,7 @@ def patch(
     )
 
 
-@app.command(hidden=True)
-def report(
+def legacy_report(
     findings_file: FindingsFileArg,
     format: FormatOption = None,
     attestation: AttestationOption = False,
@@ -7136,7 +7509,7 @@ def _register_collapsed_command_aliases() -> None:
     pipeline_app.command("verify")(verify)
     pipeline_app.command("legal")(legal)
     pipeline_app.command("patch")(patch)
-    pipeline_app.command("report")(report)
+    pipeline_app.command("report")(legacy_report)
 
     dev_app.command("watch")(watch)
     dev_app.command("lsp")(lsp)
