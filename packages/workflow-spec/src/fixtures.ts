@@ -8,7 +8,7 @@ import type {
 } from "./types.js";
 
 const createdAt = "2026-05-18T00:00:00.000Z";
-const checksumA = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const checksumA = "sha256:fe7089c55f65f4fe08e04af27951ea6b70c2262332c3079591326fd471ee1279";
 const checksumB = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 export const stringSchema: JsonSchemaShape = { type: "string" };

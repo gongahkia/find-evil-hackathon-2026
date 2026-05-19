@@ -104,6 +104,16 @@ export interface WorkflowApprovalRecord {
   readonly nodeOrder: readonly string[];
 }
 
+export interface WorkflowNodeExecutionAttempt {
+  readonly attempt: number;
+  readonly status: "succeeded" | "failed" | "timed_out" | "cancelled";
+  readonly startedAt: string;
+  readonly finishedAt: string;
+  readonly exitCode?: number | undefined;
+  readonly error?: string | undefined;
+  readonly workspacePath?: string | undefined;
+}
+
 export interface WorkflowSpec {
   readonly id: string;
   readonly schemaVersion: WorkflowSchemaVersion;
@@ -122,7 +132,15 @@ export interface WorkflowNodeExecutionResult {
   readonly status: "succeeded" | "failed" | "skipped";
   readonly startedAt: string;
   readonly finishedAt: string;
+  readonly input?: JsonRecord | undefined;
   readonly output: JsonRecord;
+  readonly error?: string | undefined;
+  readonly workspacePath?: string | undefined;
+  readonly stdoutPath?: string | undefined;
+  readonly stderrPath?: string | undefined;
+  readonly artifacts?: readonly string[] | undefined;
+  readonly attempts?: readonly WorkflowNodeExecutionAttempt[] | undefined;
+  readonly metadata?: JsonRecord | undefined;
 }
 
 export interface WorkflowExecutionResult {
@@ -133,7 +151,9 @@ export interface WorkflowExecutionResult {
   readonly startedAt: string;
   readonly finishedAt: string;
   readonly nodeResults: readonly WorkflowNodeExecutionResult[];
+  readonly events?: readonly WorkflowRunEvent[] | undefined;
   readonly deterministic: true;
+  readonly metadata?: JsonRecord | undefined;
 }
 
 export const workflowValidationErrorCodes = [
