@@ -4,6 +4,7 @@ import { createDefaultMockAdapters } from "@kelpclaw/adapters";
 import { AdapterBackedNodeRunner, MockNodeRunner } from "@kelpclaw/nanoclaw";
 import { clearPromotedSkillsForTests } from "@kelpclaw/skill-registry";
 import { gmailReceiptsToSheetsWorkflowFixture } from "@kelpclaw/workflow-spec";
+import type { WorkflowJob } from "@kelpclaw/workflow-spec";
 import {
   buildApiApp,
   createDeterministicPlannerBackend,
@@ -256,6 +257,347 @@ describe("kelpclaw api contracts", () => {
     expect(validatedAgain.json().draftRevision.id).toBe(validated.json().draftRevision.id);
   });
 
+  it("routes adapter prompts without a live model", async () => {
+    app = buildTestApiApp();
+
+    const planned = await app.inject({
+      method: "POST",
+      url: "/api/workflows/plan",
+      payload: {
+        prompt: "extract transaction details from Gmail receipts into Sheets"
+      }
+    });
+
+    expect(planned.statusCode).toBe(200);
+    expect(planned.json().route.route).toBe("adapter");
+    expect(planned.json().route.requiredModel.mode).toBe("none");
+  });
+
+  it("returns graph feedback without mutating the edited draft", async () => {
+    app = buildTestApiApp();
+
+    const planned = await app.inject({
+      method: "POST",
+      url: "/api/workflows/plan",
+      payload: {
+        prompt: "extract transaction details from Gmail receipts into Sheets"
+      }
+    });
+    const baseWorkflow = planned.json().workflow;
+    const editedWorkflow = {
+      ...baseWorkflow,
+      nodes: baseWorkflow.nodes.map((node: { id: string; label: string }) =>
+        node.id === "normalize-receipts" ? { ...node, label: "Normalize With Tax" } : node
+      )
+    };
+    const feedback = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${baseWorkflow.id}/feedback`,
+      payload: {
+        baseWorkflow,
+        editedWorkflow
+      }
+    });
+
+    expect(feedback.statusCode).toBe(200);
+    expect(
+      feedback.json().graphDiff.changes.map((change: { kind: string }) => change.kind)
+    ).toContain("node.edited");
+    expect(feedback.json().feedback.status).toBe("ready");
+  });
+
+  it("persists planner suggestion decisions without mutating the workflow", async () => {
+    app = buildTestApiApp();
+    const workflow = gmailReceiptsToSheetsWorkflowFixture;
+    await app.inject({
+      method: "POST",
+      url: "/api/workflows",
+      payload: workflow
+    });
+    const editedWorkflow = {
+      ...workflow,
+      nodes: workflow.nodes.slice(1)
+    };
+    const feedback = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflow.id}/feedback`,
+      payload: {
+        baseWorkflow: workflow,
+        editedWorkflow
+      }
+    });
+    const suggestionId = feedback.json().feedback.suggestions[0].id;
+    const decided = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflow.id}/feedback/${feedback.json().feedback.id}/suggestions/${suggestionId}/decision`,
+      payload: {
+        suggestionId,
+        decision: "rejected"
+      }
+    });
+    const stored = await app.inject({
+      method: "GET",
+      url: `/api/workflows/${workflow.id}`
+    });
+
+    expect(decided.statusCode).toBe(200);
+    expect(decided.json().feedback.suggestions[0].status).toBe("rejected");
+    expect(stored.json().workflow.nodes[0].label).toBe(workflow.nodes[0]?.label);
+  });
+
+  it("records plan acceptance without creating a production approval", async () => {
+    app = buildTestApiApp();
+
+    const planned = await app.inject({
+      method: "POST",
+      url: "/api/workflows/plan",
+      payload: {
+        prompt: "extract transaction details from Gmail receipts into Sheets"
+      }
+    });
+    const accepted = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${planned.json().workflow.id}/accept-plan`,
+      payload: {
+        workflow: planned.json().workflow,
+        acceptedBy: "owner@example.com"
+      }
+    });
+    const stored = await app.inject({
+      method: "GET",
+      url: `/api/workflows/${planned.json().workflow.id}`
+    });
+
+    expect(accepted.statusCode).toBe(200);
+    expect(accepted.json().draftRevision.source).toBe("plan-accepted");
+    expect(accepted.json().workflow.approval).toBeNull();
+    expect(stored.json().latestApprovedRevisionId).toBeNull();
+  });
+
+  it("keeps branch planning and acceptance local to the selected branch", async () => {
+    app = buildTestApiApp();
+
+    const planned = await app.inject({
+      method: "POST",
+      url: "/api/workflows/plan",
+      payload: {
+        prompt: "extract transaction details from Gmail receipts into Sheets"
+      }
+    });
+    const workflowId = planned.json().workflow.id;
+    const listed = await app.inject({
+      method: "GET",
+      url: `/api/workflows/${workflowId}/branches`
+    });
+    const mainBranch = listed.json().branches[0];
+    const forked = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflowId}/branches`,
+      payload: {
+        name: "Support alerts",
+        createdBy: "owner@example.com",
+        fromBranchId: mainBranch.id
+      }
+    });
+    const branchPlan = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflowId}/branches/${forked.json().branch.id}/plan`,
+      payload: {
+        prompt: "monitor urgent support messages and send Telegram alerts",
+        actor: "owner@example.com"
+      }
+    });
+    const accepted = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflowId}/branches/${forked.json().branch.id}/accept-plan`,
+      payload: {
+        workflow: branchPlan.json().workflow,
+        acceptedBy: "owner@example.com"
+      }
+    });
+    const main = await app.inject({
+      method: "GET",
+      url: `/api/workflows/${workflowId}/branches/${mainBranch.id}`
+    });
+    const branch = await app.inject({
+      method: "GET",
+      url: `/api/workflows/${workflowId}/branches/${forked.json().branch.id}`
+    });
+
+    expect(listed.statusCode).toBe(200);
+    expect(forked.statusCode).toBe(201);
+    expect(branchPlan.statusCode).toBe(200);
+    expect(branchPlan.json().draftRevision.source).toBe("branch-plan");
+    expect(accepted.json().draftRevision.source).toBe("plan-accepted");
+    expect(main.json().headDraftRevision.workflow.prompt).toContain("Gmail receipts");
+    expect(branch.json().headDraftRevision.workflow.prompt).toContain("urgent support");
+    expect(branch.json().promptTurns.map((turn: { source: string }) => turn.source)).toContain(
+      "plan"
+    );
+  });
+
+  it("previews clean branch merges and conflicting branch edits", async () => {
+    app = buildTestApiApp();
+
+    const planned = await app.inject({
+      method: "POST",
+      url: "/api/workflows/plan",
+      payload: {
+        prompt: "extract transaction details from Gmail receipts into Sheets"
+      }
+    });
+    const workflowId = planned.json().workflow.id;
+    const listed = await app.inject({
+      method: "GET",
+      url: `/api/workflows/${workflowId}/branches`
+    });
+    const mainBranch = listed.json().branches[0];
+    const forked = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflowId}/branches`,
+      payload: {
+        name: "Tax parsing",
+        createdBy: "owner@example.com",
+        fromBranchId: mainBranch.id
+      }
+    });
+    const sourceReprompt = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflowId}/branches/${forked.json().branch.id}/reprompt-node`,
+      payload: {
+        nodeId: "read-gmail-receipts",
+        prompt: "Read Gmail receipts and extract tax totals.",
+        actor: "owner@example.com"
+      }
+    });
+    const cleanPreview = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflowId}/branches/${forked.json().branch.id}/merge-preview`,
+      payload: {
+        targetBranchId: mainBranch.id
+      }
+    });
+    const applied = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflowId}/branches/${forked.json().branch.id}/merge`,
+      payload: {
+        targetBranchId: mainBranch.id,
+        appliedBy: "owner@example.com",
+        resolutions: []
+      }
+    });
+    const targetReprompt = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflowId}/branches/${mainBranch.id}/reprompt-node`,
+      payload: {
+        nodeId: "read-gmail-receipts",
+        prompt: "Read Gmail receipts and extract merchant names.",
+        actor: "owner@example.com",
+        currentWorkflow: planned.json().workflow
+      }
+    });
+    const conflicting = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflowId}/branches/${forked.json().branch.id}/merge-preview`,
+      payload: {
+        targetBranchId: mainBranch.id
+      }
+    });
+
+    expect(sourceReprompt.statusCode).toBe(200);
+    expect(cleanPreview.json().preview.status).toBe("clean");
+    expect(applied.statusCode).toBe(200);
+    expect(applied.json().draftRevision.source).toBe("branch-merge");
+    expect(targetReprompt.statusCode).toBe(200);
+    expect(conflicting.json().preview.status).toBe("conflicts");
+    expect(conflicting.json().preview.conflicts[0].kind).toBe("both-edited");
+  });
+
+  it("creates, cancels, and streams job events", async () => {
+    app = buildTestApiApp();
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/jobs",
+      payload: {
+        type: "feedback.graph",
+        workflowId: "workflow.test"
+      }
+    });
+    const cancelled = await app.inject({
+      method: "POST",
+      url: `/api/jobs/${created.json().job.id}/cancel`,
+      payload: {
+        reason: "test cancellation"
+      }
+    });
+    const events = await app.inject({
+      method: "GET",
+      url: `/api/jobs/${created.json().job.id}/events`
+    });
+
+    expect(created.statusCode).toBe(201);
+    expect(cancelled.json().job.status).toBe("cancelled");
+    expect(events.statusCode).toBe(200);
+    expect(events.body).toContain("event: job-complete");
+  });
+
+  it("claims queued jobs through the local durable worker", async () => {
+    app = buildTestApiApp();
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/jobs",
+      payload: {
+        type: "smoke.integration",
+        workflowId: "workflow.worker",
+        payload: {
+          durationMs: 1
+        }
+      }
+    });
+    const completed = await waitForJobStatus(app, created.json().job.id, "succeeded");
+
+    expect(created.statusCode).toBe(201);
+    expect(completed.status).toBe("succeeded");
+    expect(completed.workerId).toMatch(/^worker\./u);
+    expect(completed.claimedAt).toBeDefined();
+    expect(completed.retry.attempt).toBe(1);
+    expect(completed.result?.workerId).toBe(completed.workerId);
+    expect(completed.events.map((event: { message: string }) => event.message)).toContain(
+      "Job claimed by local worker."
+    );
+  });
+
+  it("cancels active local worker jobs", async () => {
+    app = buildTestApiApp();
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/jobs",
+      payload: {
+        type: "smoke.integration",
+        workflowId: "workflow.worker",
+        payload: {
+          durationMs: 1000
+        }
+      }
+    });
+    await waitForJobStatus(app, created.json().job.id, "running");
+    const cancelled = await app.inject({
+      method: "POST",
+      url: `/api/jobs/${created.json().job.id}/cancel`,
+      payload: {
+        reason: "stop worker"
+      }
+    });
+    const terminal = await waitForJobStatus(app, created.json().job.id, "cancelled");
+
+    expect(cancelled.statusCode).toBe(200);
+    expect(terminal.status).toBe("cancelled");
+    expect(terminal.cancellationReason).toBe("stop worker");
+  });
+
   it("plans codegen fallback nodes with persisted artifact metadata", async () => {
     app = buildTestApiApp();
 
@@ -289,6 +631,12 @@ describe("kelpclaw api contracts", () => {
       }
     });
     const workflow = planned.json().workflow;
+    const evaluated = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflow.id}/evaluate-draft`,
+      payload: { workflow, mockOnly: true }
+    });
+    expect(evaluated.statusCode).toBe(200);
     const blockedApproval = await app.inject({
       method: "POST",
       url: `/api/workflows/${workflow.id}/approve`,
@@ -313,6 +661,28 @@ describe("kelpclaw api contracts", () => {
       }
     });
     const workflow = planned.json().workflow;
+    const built = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflow.id}/codegen/scrape-status-page/build`,
+      payload: {
+        runTestsInDocker: false
+      }
+    });
+    expect(built.statusCode).toBe(200);
+    expect(built.json().workspace.mountedAgents).toContain("evaluator");
+    expect(
+      built
+        .json()
+        .workspace.fileHashes.some(
+          (file: { readonly path: string }) => file.path === "generated/scrape-status-page.ts"
+        )
+    ).toBe(true);
+    const evals = await app.inject({
+      method: "GET",
+      url: `/api/workflows/${workflow.id}/codegen/scrape-status-page/evals`
+    });
+    expect(evals.statusCode).toBe(200);
+    expect(evals.json().evalReports[0].status).toBe("passed");
     const reviewed = await app.inject({
       method: "POST",
       url: `/api/workflows/${workflow.id}/codegen/scrape-status-page/review`,
@@ -325,6 +695,12 @@ describe("kelpclaw api contracts", () => {
 
     expect(reviewed.statusCode).toBe(200);
     expect(reviewed.json().node.codegen.review.status).toBe("approved");
+    const evaluated = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflow.id}/evaluate-draft`,
+      payload: { workflow: reviewed.json().workflow, mockOnly: true }
+    });
+    expect(evaluated.statusCode).toBe(200);
 
     const approved = await app.inject({
       method: "POST",
@@ -335,6 +711,243 @@ describe("kelpclaw api contracts", () => {
       }
     });
     expect(approved.statusCode).toBe(200);
+  });
+
+  it("reuses generated modules across branches only after a passing eval", async () => {
+    app = buildTestApiApp();
+
+    const planned = await app.inject({
+      method: "POST",
+      url: "/api/workflows/plan",
+      payload: {
+        prompt: "scrape a custom public status page and summarize incidents"
+      }
+    });
+    const workflow = planned.json().workflow;
+    const built = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflow.id}/codegen/scrape-status-page/build`,
+      payload: {
+        runTestsInDocker: false
+      }
+    });
+    const listed = await app.inject({
+      method: "GET",
+      url: `/api/workflows/${workflow.id}/branches`
+    });
+    const mainBranch = listed.json().branches[0];
+    const forked = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflow.id}/branches`,
+      payload: {
+        name: "Reuse candidate",
+        createdBy: "owner@example.com",
+        fromBranchId: mainBranch.id
+      }
+    });
+    const reuse = await app.inject({
+      method: "GET",
+      url: `/api/workflows/${workflow.id}/branches/${forked.json().branch.id}/reuse-candidates`
+    });
+    const reprompted = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflow.id}/branches/${forked.json().branch.id}/reprompt-node`,
+      payload: {
+        nodeId: "scrape-status-page",
+        prompt: "Scrape the status page with a different output schema.",
+        actor: "owner@example.com"
+      }
+    });
+    const blocked = await app.inject({
+      method: "GET",
+      url: `/api/workflows/${workflow.id}/branches/${forked.json().branch.id}/reuse-candidates`
+    });
+
+    expect(built.statusCode).toBe(200);
+    expect(reuse.statusCode).toBe(200);
+    expect(reuse.json().decisions[0]).toMatchObject({
+      nodeId: "scrape-status-page",
+      status: "reuse-with-reeval",
+      sourceBranchId: mainBranch.id,
+      sourceEvalReportId: expect.any(String)
+    });
+    expect(reprompted.statusCode).toBe(200);
+    expect(blocked.json().decisions[0].status).toBe("blocked-drift");
+    expect(blocked.json().decisions[0].gates).toContain("prompt");
+  });
+
+  it("automatically applies safe generated module reuse after branch reprompt and merge", async () => {
+    app = buildTestApiApp();
+
+    const planned = await app.inject({
+      method: "POST",
+      url: "/api/workflows/plan",
+      payload: {
+        prompt: "scrape a custom public status page and summarize incidents"
+      }
+    });
+    const workflow = planned.json().workflow;
+    const built = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflow.id}/codegen/scrape-status-page/build`,
+      payload: {
+        runTestsInDocker: false
+      }
+    });
+    const reviewed = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflow.id}/codegen/scrape-status-page/review`,
+      payload: {
+        status: "approved",
+        reviewedBy: "owner@example.com"
+      }
+    });
+    const listed = await app.inject({
+      method: "GET",
+      url: `/api/workflows/${workflow.id}/branches`
+    });
+    const mainBranch = listed.json().branches[0];
+    const forked = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflow.id}/branches`,
+      payload: {
+        name: "Reuse reprompt",
+        createdBy: "owner@example.com",
+        fromBranchId: mainBranch.id
+      }
+    });
+    const reprompted = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflow.id}/branches/${forked.json().branch.id}/reprompt-node`,
+      payload: {
+        nodeId: "summarize-incidents",
+        prompt: "Summarize incidents with customer-facing wording.",
+        actor: "owner@example.com"
+      }
+    });
+    const reusedNode = reprompted
+      .json()
+      .workflow.nodes.find((node: { readonly id: string }) => node.id === "scrape-status-page");
+    const blockedApproval = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflow.id}/approve`,
+      payload: {
+        workflow: reprompted.json().workflow,
+        approvedBy: "owner@example.com",
+        branchId: forked.json().branch.id
+      }
+    });
+    const merged = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflow.id}/branches/${forked.json().branch.id}/merge`,
+      payload: {
+        targetBranchId: mainBranch.id,
+        appliedBy: "owner@example.com",
+        resolutions: []
+      }
+    });
+
+    expect(built.statusCode).toBe(200);
+    expect(reviewed.statusCode).toBe(200);
+    expect(reprompted.statusCode).toBe(200);
+    expect(reprompted.json().draftRevision.source).toBe("branch-reprompt");
+    expect(reprompted.json().promptTurn.metadata).toMatchObject({ reuseApplied: true });
+    expect(reprompted.json().branch.metadata).toMatchObject({ latestReuseApplied: true });
+    expect(reusedNode.config.reusedFromBranchId).toBe(mainBranch.id);
+    expect(reusedNode.codegen.review.status).toBe("draft");
+    expect(blockedApproval.statusCode).toBe(409);
+    expect(merged.statusCode).toBe(200);
+    expect(merged.json().draftRevision.source).toBe("branch-merge");
+    expect(merged.json().branch.metadata.latestReuseApplied).toBe(true);
+  });
+
+  it("updates branch metadata and keeps archived branches read-only but readable", async () => {
+    app = buildTestApiApp();
+
+    const planned = await app.inject({
+      method: "POST",
+      url: "/api/workflows/plan",
+      payload: {
+        prompt: "extract transaction details from Gmail receipts into Sheets"
+      }
+    });
+    const workflowId = planned.json().workflow.id;
+    const listed = await app.inject({
+      method: "GET",
+      url: `/api/workflows/${workflowId}/branches`
+    });
+    const mainBranch = listed.json().branches[0];
+    const alpha = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflowId}/branches`,
+      payload: {
+        name: "Alpha",
+        createdBy: "owner@example.com",
+        fromBranchId: mainBranch.id
+      }
+    });
+    const beta = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflowId}/branches`,
+      payload: {
+        name: "Beta",
+        createdBy: "owner@example.com",
+        fromBranchId: mainBranch.id
+      }
+    });
+    const duplicate = await app.inject({
+      method: "PATCH",
+      url: `/api/workflows/${workflowId}/branches/${beta.json().branch.id}`,
+      payload: {
+        name: "Alpha",
+        updatedBy: "owner@example.com"
+      }
+    });
+    const archived = await app.inject({
+      method: "PATCH",
+      url: `/api/workflows/${workflowId}/branches/${beta.json().branch.id}`,
+      payload: {
+        status: "archived",
+        updatedBy: "owner@example.com"
+      }
+    });
+    const renamedToArchivedName = await app.inject({
+      method: "PATCH",
+      url: `/api/workflows/${workflowId}/branches/${alpha.json().branch.id}`,
+      payload: {
+        name: "Beta",
+        updatedBy: "owner@example.com"
+      }
+    });
+    const archiveMain = await app.inject({
+      method: "PATCH",
+      url: `/api/workflows/${workflowId}/branches/${mainBranch.id}`,
+      payload: {
+        status: "archived",
+        updatedBy: "owner@example.com"
+      }
+    });
+    const archivedBranchRead = await app.inject({
+      method: "GET",
+      url: `/api/workflows/${workflowId}/branches/${beta.json().branch.id}`
+    });
+    const archivedPlan = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflowId}/branches/${beta.json().branch.id}/plan`,
+      payload: {
+        prompt: "monitor urgent support messages and send Telegram alerts",
+        actor: "owner@example.com"
+      }
+    });
+
+    expect(duplicate.statusCode).toBe(409);
+    expect(archived.statusCode).toBe(200);
+    expect(archived.json().branch.status).toBe("archived");
+    expect(renamedToArchivedName.statusCode).toBe(200);
+    expect(archiveMain.statusCode).toBe(409);
+    expect(archivedBranchRead.statusCode).toBe(200);
+    expect(archivedPlan.statusCode).toBe(409);
+    expect(archivedPlan.json().error).toBe("WORKFLOW_BRANCH_ARCHIVED");
   });
 
   it("promotes reviewed generated code into a reusable skill for future planning", async () => {
@@ -425,6 +1038,12 @@ describe("kelpclaw api contracts", () => {
     expect(blockedApproval.json().validation.errors[0].code).toBe(
       "WORKFLOW_EDGE_SOURCE_NODE_MISSING"
     );
+    const evaluated = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflow.id}/evaluate-draft`,
+      payload: { workflow: reprompted.json().workflow, mockOnly: true }
+    });
+    expect(evaluated.statusCode).toBe(200);
 
     const approved = await app.inject({
       method: "POST",
@@ -527,6 +1146,12 @@ describe("kelpclaw api contracts", () => {
       url: "/api/workflows/workflow.gmail-receipts-to-sheets/executions"
     });
     expect(blocked.statusCode).toBe(409);
+    const evaluated = await app.inject({
+      method: "POST",
+      url: "/api/workflows/workflow.gmail-receipts-to-sheets/evaluate-draft",
+      payload: { workflow: created.json().workflow, mockOnly: true }
+    });
+    expect(evaluated.statusCode).toBe(200);
 
     const approval = await app.inject({
       method: "POST",
@@ -560,6 +1185,154 @@ describe("kelpclaw api contracts", () => {
     });
     expect(fetched.statusCode).toBe(200);
     expect(fetched.json().workflowId).toBe("workflow.gmail-receipts-to-sheets");
+  });
+
+  it("creates workflow-native deployment records only after approval and draft eval", async () => {
+    app = buildTestApiApp();
+
+    const planned = await app.inject({
+      method: "POST",
+      url: "/api/workflows/plan",
+      payload: {
+        prompt: "extract transaction details from Gmail receipts into Sheets"
+      }
+    });
+    const workflow = planned.json().workflow;
+    const blocked = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflow.id}/deployments`,
+      payload: {
+        approvedRevisionId: `approved.${workflow.id}.r1`,
+        kind: "workflow.bundle",
+        createdBy: "owner@example.com",
+        rollbackPlan: "Rollback to the previous approved revision."
+      }
+    });
+    expect(blocked.statusCode).toBe(404);
+
+    await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflow.id}/evaluate-draft`,
+      payload: { workflow, mockOnly: true }
+    });
+    const approved = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflow.id}/approve`,
+      payload: {
+        workflow,
+        approvedBy: "owner@example.com"
+      }
+    });
+    const deployed = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflow.id}/deployments`,
+      payload: {
+        approvedRevisionId: approved.json().approvedRevisionId,
+        kind: "workflow.bundle",
+        createdBy: "owner@example.com",
+        rollbackPlan: "Rollback to the previous approved revision."
+      }
+    });
+    const runnerDeployment = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflow.id}/deployments`,
+      payload: {
+        approvedRevisionId: approved.json().approvedRevisionId,
+        kind: "runner.configuration",
+        createdBy: "owner@example.com",
+        rollbackPlan: "Rollback to the previous approved revision."
+      }
+    });
+    const deployments = await app.inject({
+      method: "GET",
+      url: `/api/workflows/${workflow.id}/deployments`
+    });
+    const active = await app.inject({
+      method: "GET",
+      url: `/api/workflows/${workflow.id}/deployments/active`
+    });
+    const run = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflow.id}/runs`,
+      payload: {
+        approvedRevisionId: approved.json().approvedRevisionId
+      }
+    });
+
+    expect(approved.statusCode).toBe(200);
+    expect(deployed.statusCode).toBe(201);
+    expect(deployed.json().deployment.status).toBe("deployed");
+    expect(deployed.json().deployment.metadata.bundle.path).toContain("workflow-bundle.json");
+    expect(runnerDeployment.statusCode).toBe(201);
+    expect(runnerDeployment.json().deployment.metadata.runnerConfig.status).toBe("active");
+    expect(deployments.json().deployments).toHaveLength(2);
+    expect(active.json().runnerConfigurations[0].deploymentId).toBe(
+      runnerDeployment.json().deployment.id
+    );
+    expect(run.statusCode).toBe(202);
+    expect(run.json().run.events[0].metadata.runnerDeploymentId).toBe(
+      runnerDeployment.json().deployment.id
+    );
+  });
+
+  it("activates scheduled deployments as durable local registrations", async () => {
+    app = buildTestApiApp();
+
+    const planned = await app.inject({
+      method: "POST",
+      url: "/api/workflows/plan",
+      payload: {
+        prompt: "extract transaction details from Gmail receipts into Sheets"
+      }
+    });
+    const workflow = {
+      ...planned.json().workflow,
+      nodes: planned.json().workflow.nodes.map((node: { readonly id: string; config: object }) =>
+        node.id === "manual-trigger"
+          ? {
+              ...node,
+              config: {
+                ...node.config,
+                schedule: "0 8 * * *",
+                timezone: "UTC"
+              }
+            }
+          : node
+      )
+    };
+    await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflow.id}/evaluate-draft`,
+      payload: { workflow, mockOnly: true }
+    });
+    const approved = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflow.id}/approve`,
+      payload: {
+        workflow,
+        approvedBy: "owner@example.com"
+      }
+    });
+    const deployed = await app.inject({
+      method: "POST",
+      url: `/api/workflows/${workflow.id}/deployments`,
+      payload: {
+        approvedRevisionId: approved.json().approvedRevisionId,
+        kind: "schedule.activation",
+        createdBy: "owner@example.com",
+        rollbackPlan: "Disable the schedule registration."
+      }
+    });
+    const active = await app.inject({
+      method: "GET",
+      url: `/api/workflows/${workflow.id}/deployments/active`
+    });
+
+    expect(deployed.statusCode).toBe(201);
+    expect(deployed.json().deployment.metadata.activeScheduleRegistrations[0].nodeId).toBe(
+      "manual-trigger"
+    );
+    expect(active.json().activeSchedules[0].schedule).toBe("0 8 * * *");
   });
 
   it("creates a new draft revision after approval", async () => {
@@ -598,4 +1371,25 @@ function restoreEnv(name: string, value: string | undefined): void {
   } else {
     process.env[name] = value;
   }
+}
+
+async function waitForJobStatus(
+  app: FastifyInstance,
+  jobId: string,
+  status: string
+): Promise<WorkflowJob> {
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline) {
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/jobs/${jobId}`
+    });
+    const job = response.json().job as WorkflowJob;
+    if (job.status === status) {
+      return job;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+
+  throw new Error(`Timed out waiting for job '${jobId}' to reach '${status}'.`);
 }

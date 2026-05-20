@@ -4,16 +4,32 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   AgentSdkCodeGenerator,
+  AgentSdkGeneratedNodeRoleRunner,
+  DockerGeneratedNodeTestExecutor,
+  GeneratedNodeBuildLoop,
   LocalCodegenArtifactStore,
   assertSafeArtifactPath,
   createDependencyManifestArtifact,
   createArtifactManifest,
   createCodegenMetadata,
   createGeneratedArtifact,
+  createGeneratedModuleSignature,
   decideReplay,
+  generatedModuleSignaturesMatch,
   assertDependencyManifestPolicy
 } from "../src/index.js";
-import type { AgentQueryRunner, CodegenGenerationRequest } from "../src/index.js";
+import { scheduledScrapingWorkflowFixture } from "@kelpclaw/workflow-spec";
+import type {
+  AgentQueryRunner,
+  AgentRoleQueryRunner,
+  CodeGenerator,
+  CodegenGenerationRequest,
+  DockerGeneratedNodeCommand,
+  DockerGeneratedNodeCommandRunner,
+  GeneratedNodeBuildLoopRequest,
+  GeneratedNodeRoleRunner,
+  GeneratedNodeTestExecutor
+} from "../src/index.js";
 
 describe("codegen artifact contracts", () => {
   it("creates artifacts with stable checksums", () => {
@@ -176,6 +192,33 @@ describe("codegen artifact contracts", () => {
     });
   });
 
+  it("computes generated module signatures from reusable node contracts", () => {
+    const node = scheduledScrapingWorkflowFixture.nodes.find(
+      (candidate) => candidate.id === "scrape-status-page"
+    );
+    if (!node?.codegen) {
+      throw new Error("Scheduled scraping fixture is missing a codegen node.");
+    }
+
+    const signature = createGeneratedModuleSignature(node);
+    const dependencyDrift = createGeneratedModuleSignature({
+      ...node,
+      codegen: {
+        ...node.codegen,
+        dependencyManifest: {
+          ...node.codegen.dependencyManifest,
+          dependencies: ["undici@6.0.0"]
+        }
+      }
+    });
+
+    expect(signature.promptHash).toMatch(/^sha256:[a-f0-9]{64}$/);
+    expect(generatedModuleSignaturesMatch(signature, createGeneratedModuleSignature(node))).toBe(
+      true
+    );
+    expect(generatedModuleSignaturesMatch(signature, dependencyDrift)).toBe(false);
+  });
+
   it("stores generated artifacts by content hash and materializes them", async () => {
     const storeRoot = await mkdtemp(join(tmpdir(), "kelpclaw-codegen-store-"));
     const targetRoot = await mkdtemp(join(tmpdir(), "kelpclaw-codegen-target-"));
@@ -268,7 +311,406 @@ describe("codegen artifact contracts", () => {
       "ANTHROPIC_API_KEY is required"
     );
   });
+
+  it("creates design, source, test, and eval agent artifacts through the build loop", async () => {
+    const loop = new GeneratedNodeBuildLoop();
+    const result = await loop.build(buildLoopRequestFixture());
+
+    expect(result.designSpecArtifact.path).toBe("generated/scrape-status-page.design.json");
+    expect(result.testArtifacts[0]?.path).toBe("generated/scrape-status-page.contract.test.ts");
+    expect(result.generation.metadata.provenance.generator).toBe(
+      "kelpclaw.codegen.deterministic-build-loop"
+    );
+    expect(result.agentRuns.map((run) => run.role)).toEqual([
+      "workflow-architect",
+      "coder",
+      "tester",
+      "runner",
+      "evaluator"
+    ]);
+  });
+
+  it("runs role-specific Agent SDK agents through the generated-node loop", async () => {
+    const rolePrompts: string[] = [];
+    const roleRunner: AgentRoleQueryRunner = async function* (prompt, options) {
+      rolePrompts.push(`${options.model ?? "default"}:${prompt.split("\n")[0] ?? ""}`);
+      yield {
+        type: "result",
+        total_cost_usd: 0.05,
+        duration_ms: 12,
+        usage: {
+          input_tokens: 10,
+          output_tokens: 5
+        },
+        structured_output: {
+          summary: `completed ${prompt.match(/You are the ([^ ]+) agent/u)?.[1] ?? "role"}`,
+          status: "succeeded",
+          outputArtifactRefs: []
+        }
+      };
+    };
+    const roles = [
+      "workflow-architect",
+      "coder",
+      "tester",
+      "runner",
+      "fixer",
+      "evaluator"
+    ] as const;
+    const loop = new GeneratedNodeBuildLoop({
+      roleRunners: Object.fromEntries(
+        roles.map((role) => [
+          role,
+          new AgentSdkGeneratedNodeRoleRunner({
+            role,
+            apiKey: "test-key",
+            model: `claude-${role}`,
+            queryRunner: roleRunner
+          })
+        ])
+      ),
+      testExecutor: failOnceThenPassExecutor("schema mismatch")
+    });
+
+    const result = await loop.build(buildLoopRequestFixture());
+
+    expect(result.status).toBe("passed");
+    expect(result.agentRuns.map((run) => run.role)).toContain("fixer");
+    expect(result.agentRuns.every((run) => run.modelProvider === "anthropic")).toBe(true);
+    expect(
+      result.agentRuns.flatMap((run) => run.modelInvocations ?? []).map((record) => record.provider)
+    ).toEqual(rolePrompts.map(() => "anthropic"));
+    expect(result.agentRuns[0]?.modelInvocations?.[0]).toMatchObject({
+      costUsd: 0.05,
+      durationMs: 12,
+      inputTokens: 10,
+      outputTokens: 5,
+      totalTokens: 15
+    });
+    expect(rolePrompts.some((prompt) => prompt.startsWith("claude-fixer:"))).toBe(true);
+  });
+
+  it("runs generated-node evals through Docker when requested", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "kelpclaw-codegen-docker-"));
+    let capturedCommand: DockerGeneratedNodeCommand | undefined;
+    const runner: DockerGeneratedNodeCommandRunner = {
+      async run(command) {
+        capturedCommand = command;
+        return {
+          exitCode: 0,
+          stdout: "node ok\n",
+          stderr: "",
+          output: {
+            artifact: {
+              ok: true
+            }
+          }
+        };
+      }
+    };
+    const loop = new GeneratedNodeBuildLoop({
+      testExecutor: new DockerGeneratedNodeTestExecutor({ commandRunner: runner })
+    });
+
+    const result = await loop.build({
+      ...buildLoopRequestFixture(),
+      workspaceRoot,
+      runTestsInDocker: true,
+      maxDockerRuntimeSeconds: 7
+    });
+
+    expect(result.status).toBe("passed");
+    expect(capturedCommand?.args).toContain("--network");
+    expect(capturedCommand?.args).toContain("none");
+    expect(capturedCommand?.args).toContain("node:20-alpine");
+    expect(capturedCommand?.timeoutMs).toBe(7000);
+    await expect(
+      readFile(join(workspaceRoot, "generated/scrape-status-page.docker-command.json"), "utf8")
+    ).resolves.toContain('"network": "none"');
+    await expect(
+      readFile(join(workspaceRoot, "generated/scrape-status-page.docker-output.json"), "utf8")
+    ).resolves.toContain('"artifact"');
+  });
+
+  it("fails Docker evals when the output payload does not match declared ports", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "kelpclaw-codegen-docker-fail-"));
+    const runner: DockerGeneratedNodeCommandRunner = {
+      async run() {
+        return {
+          exitCode: 0,
+          stdout: "",
+          stderr: "",
+          output: {
+            wrongPort: true
+          }
+        };
+      }
+    };
+    const loop = new GeneratedNodeBuildLoop({
+      testExecutor: new DockerGeneratedNodeTestExecutor({ commandRunner: runner })
+    });
+
+    const result = await loop.build({
+      ...buildLoopRequestFixture(),
+      workspaceRoot,
+      runTestsInDocker: true,
+      maxIterations: 1
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.findings.map((finding) => finding.id)).toContain(
+      "finding.scrape-status-page.docker-schema"
+    );
+    expect(result.unresolvedFailureArtifact?.content).toContain("declared output ports");
+  });
+
+  it("persists Docker timeout and stderr artifacts for failed evals", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "kelpclaw-codegen-docker-timeout-"));
+    const runner: DockerGeneratedNodeCommandRunner = {
+      async run() {
+        return {
+          exitCode: 1,
+          stdout: "",
+          stderr: "runtime exceeded\n",
+          timedOut: true,
+          output: {
+            artifact: {
+              ok: true
+            }
+          }
+        };
+      }
+    };
+    const loop = new GeneratedNodeBuildLoop({
+      testExecutor: new DockerGeneratedNodeTestExecutor({ commandRunner: runner })
+    });
+
+    const result = await loop.build({
+      ...buildLoopRequestFixture(),
+      workspaceRoot,
+      runTestsInDocker: true,
+      maxDockerRuntimeSeconds: 1,
+      maxIterations: 1
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.findings.map((finding) => finding.id)).toEqual(
+      expect.arrayContaining([
+        "finding.scrape-status-page.docker-timeout",
+        "finding.scrape-status-page.docker-exit"
+      ])
+    );
+    await expect(
+      readFile(join(workspaceRoot, "generated/scrape-status-page.docker-stderr.log"), "utf8")
+    ).resolves.toBe("runtime exceeded\n");
+  });
+
+  it("emits unresolved failure artifacts after max generated-node iterations", async () => {
+    const loop = new GeneratedNodeBuildLoop({
+      testExecutor: alwaysFailingTestExecutor("schema mismatch")
+    });
+
+    const result = await loop.build({
+      ...buildLoopRequestFixture(),
+      maxIterations: 2
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.fixHistory).toHaveLength(2);
+    expect(result.unresolvedFailureArtifact?.path).toBe(
+      "generated/scrape-status-page.unresolved-failure.json"
+    );
+    expect(result.agentRuns.map((run) => run.role)).toContain("fixer");
+  });
+
+  it("stops the generated-node loop when the model budget is exhausted", async () => {
+    const costlyCoder: GeneratedNodeRoleRunner = {
+      role: "coder",
+      async run(input) {
+        const generation = await input.generateCode(input.request);
+        return {
+          status: "succeeded",
+          inputSummary: input.inputSummary,
+          outputArtifactRefs: [
+            {
+              path: generation.sourceArtifact.path,
+              checksum: generation.sourceArtifact.checksum,
+              contentType: generation.sourceArtifact.contentType
+            }
+          ],
+          generation,
+          modelCostUsd: 5
+        };
+      }
+    };
+    const loop = new GeneratedNodeBuildLoop({
+      roleRunners: { coder: costlyCoder },
+      testExecutor: alwaysFailingTestExecutor("needs repair")
+    });
+
+    const result = await loop.build({
+      ...buildLoopRequestFixture(),
+      maxIterations: 3,
+      maxModelCostUsd: 1
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.fixHistory[0]).toContain("needs repair");
+    expect(result.unresolvedFailureArtifact?.content).toContain("model budget");
+  });
+
+  it("honors cancellation signals during generated-node builds", async () => {
+    const controller = new AbortController();
+    controller.abort(new Error("cancelled by test"));
+    const loop = new GeneratedNodeBuildLoop();
+
+    await expect(
+      loop.build({
+        ...buildLoopRequestFixture(),
+        signal: controller.signal
+      })
+    ).rejects.toThrow("cancelled by test");
+  });
+
+  it("rejects generated files that escape the scoped workspace", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "kelpclaw-codegen-escape-"));
+    const dependencyManifestArtifact = createDependencyManifestArtifact({ packageManager: "none" });
+    const safeArtifact = createGeneratedArtifact({
+      path: "generated/safe.ts",
+      content: "export {};",
+      contentType: "text/typescript"
+    });
+    const generator: CodeGenerator = {
+      async generate(request) {
+        return {
+          sourceArtifact: {
+            ...safeArtifact,
+            path: "../escape.ts"
+          },
+          dependencyManifestArtifact,
+          dependencyManifest: {
+            path: dependencyManifestArtifact.path,
+            checksum: dependencyManifestArtifact.checksum,
+            packageManager: "none",
+            dependencies: [],
+            devDependencies: [],
+            installCommand: []
+          },
+          metadata: createCodegenMetadata({
+            generator: "test.malicious",
+            generatedAt: request.generatedAt ?? "2026-05-18T00:00:00.000Z",
+            sourcePrompt: request.prompt,
+            plannerRationale: request.plannerRationale,
+            artifact: safeArtifact,
+            dependencyManifest: {
+              path: dependencyManifestArtifact.path,
+              checksum: dependencyManifestArtifact.checksum,
+              packageManager: "none",
+              dependencies: [],
+              devDependencies: [],
+              installCommand: []
+            },
+            sandbox: request.sandbox,
+            replay: {
+              mode: "reuse-if-unchanged",
+              seed: "test"
+            }
+          })
+        };
+      }
+    };
+    const loop = new GeneratedNodeBuildLoop({ codeGenerator: generator });
+
+    await expect(
+      loop.build({
+        ...buildLoopRequestFixture(),
+        workspaceRoot
+      })
+    ).rejects.toThrow("must stay inside workspace");
+  });
 });
+
+function alwaysFailingTestExecutor(message: string): GeneratedNodeTestExecutor {
+  return {
+    async execute(input) {
+      return {
+        status: "failed",
+        logs: [message],
+        resultArtifacts: [],
+        schemaValid: false,
+        securityValid: true,
+        replayValid: true,
+        dependencyPolicyValid: true,
+        findings: [
+          {
+            id: `finding.${input.request.nodeId}.test`,
+            severity: "error",
+            target: { kind: "node", id: input.request.nodeId },
+            message,
+            issues: []
+          }
+        ],
+        failureMessage: message
+      };
+    }
+  };
+}
+
+function failOnceThenPassExecutor(message: string): GeneratedNodeTestExecutor {
+  let calls = 0;
+  return {
+    async execute(input) {
+      calls += 1;
+      if (calls === 1) {
+        return alwaysFailingTestExecutor(message).execute(input);
+      }
+
+      return {
+        status: "passed",
+        logs: ["passed after repair"],
+        resultArtifacts: [
+          createGeneratedArtifact({
+            path: `generated/${input.request.nodeId}.repaired-output.json`,
+            content: JSON.stringify({ artifact: { ok: true } }, null, 2),
+            contentType: "application/json"
+          })
+        ],
+        schemaValid: true,
+        securityValid: true,
+        replayValid: true,
+        dependencyPolicyValid: true,
+        findings: []
+      };
+    }
+  };
+}
+
+function buildLoopRequestFixture(): GeneratedNodeBuildLoopRequest {
+  return {
+    ...codegenRequestFixture(),
+    job: {
+      id: "job.build.codegen-node.test",
+      type: "build.codegen-node",
+      status: "running",
+      workflowId: "workflow.scheduled-scraping",
+      nodeId: "scrape-status-page",
+      correlationId: "corr.codegen-test",
+      createdAt: "2026-05-18T00:00:00.000Z",
+      updatedAt: "2026-05-18T00:00:00.000Z",
+      startedAt: "2026-05-18T00:00:00.000Z",
+      retry: {
+        attempt: 1,
+        maxAttempts: 1,
+        retryable: false
+      },
+      events: []
+    },
+    maxIterations: 3,
+    maxWallClockSeconds: 600,
+    maxModelCostUsd: 2,
+    runTestsInDocker: false
+  };
+}
 
 function codegenRequestFixture(): CodegenGenerationRequest {
   return {

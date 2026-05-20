@@ -1,21 +1,61 @@
 import type {
+  JsonRecord,
+  WorkflowAcceptPlanRequest,
+  WorkflowAcceptPlanResponse,
   WorkflowApproveRequest,
   WorkflowApproveResponse,
+  WorkflowBranchMergePreviewRequest,
+  WorkflowBranchMergePreviewResponse,
+  WorkflowBranchMergeRequest,
+  WorkflowBranchMergeResponse,
+  WorkflowBranchPlanRequest,
+  WorkflowBranchPlanResponse,
+  WorkflowBranchRepromptNodeRequest,
+  WorkflowBranchRepromptNodeResponse,
+  WorkflowCreateBranchRequest,
+  WorkflowCreateBranchResponse,
+  WorkflowDraftEvaluation,
+  WorkflowFeedbackRequest,
+  WorkflowFeedbackResponse,
+  WorkflowGetBranchResponse,
+  WorkflowListBranchesResponse,
   WorkflowFetchRunResponse,
   WorkflowPlanRequest,
   WorkflowPlanResponse,
+  WorkflowPlannerSuggestionDecisionRequest,
+  WorkflowPlannerSuggestionDecisionResponse,
   WorkflowRepromptNodeRequest,
   WorkflowRepromptNodeResponse,
+  WorkflowJob,
+  WorkflowJobEvent,
+  WorkflowWorkspace,
+  WorkflowDeploymentKind,
+  WorkflowDeploymentRecord,
+  WorkflowReuseCandidatesResponse,
   WorkflowStartRunRequest,
   WorkflowStartRunResponse,
+  WorkflowUpdateBranchRequest,
+  WorkflowUpdateBranchResponse,
   WorkflowValidateRequest,
   WorkflowValidateResponse
 } from "@kelpclaw/workflow-spec";
+
+export interface DeploymentActivationSummaryResponse {
+  readonly ok: true;
+  readonly activeDeployments: readonly WorkflowDeploymentRecord[];
+  readonly activeSchedules: readonly JsonRecord[];
+  readonly runnerConfigurations: readonly JsonRecord[];
+  readonly skillPublications: readonly JsonRecord[];
+  readonly integrationBindings: readonly JsonRecord[];
+  readonly bundles: readonly JsonRecord[];
+  readonly generatedServices: readonly JsonRecord[];
+}
 
 export interface CodegenReviewRequest {
   readonly status: "approved" | "rejected";
   readonly reviewedBy: string;
   readonly notes?: string | undefined;
+  readonly branchId?: string | undefined;
 }
 
 export interface CodegenReviewResponse {
@@ -37,6 +77,27 @@ export interface CodegenPromotionResponse {
     readonly checksum: string;
     readonly contentType: string;
   };
+}
+
+export interface CodegenBuildResponse {
+  readonly ok: true;
+  readonly workflow: WorkflowPlanResponse["workflow"];
+  readonly draftRevision: WorkflowPlanResponse["draftRevision"];
+  readonly validation: WorkflowValidateResponse["validation"];
+  readonly job: WorkflowJob;
+  readonly workspace: WorkflowWorkspace;
+  readonly agentRuns: readonly unknown[];
+  readonly artifacts: readonly unknown[];
+  readonly testReport: unknown;
+  readonly evalReport: unknown;
+}
+
+export interface CodegenEvalsResponse {
+  readonly ok: true;
+  readonly agentRuns: readonly unknown[];
+  readonly agentArtifacts: readonly unknown[];
+  readonly testReports: readonly unknown[];
+  readonly evalReports: readonly unknown[];
 }
 
 export interface SecretMetadata {
@@ -79,8 +140,12 @@ export class OpenClawApiError extends Error {
 }
 
 export const openClawApi = {
-  plan(request: WorkflowPlanRequest): Promise<WorkflowPlanResponse> {
-    return postJson("/api/workflows/plan", request);
+  plan(request: WorkflowPlanRequest, jobId?: string | undefined): Promise<WorkflowPlanResponse> {
+    return postJson(
+      "/api/workflows/plan",
+      request,
+      jobId ? { "x-kelpclaw-job-id": jobId } : undefined
+    );
   },
 
   validate(
@@ -97,8 +162,149 @@ export const openClawApi = {
     return postJson(`/api/workflows/${encodeURIComponent(workflowId)}/reprompt-node`, request);
   },
 
+  feedback(
+    workflowId: string,
+    request: WorkflowFeedbackRequest,
+    jobId?: string | undefined
+  ): Promise<WorkflowFeedbackResponse> {
+    return postJson(
+      `/api/workflows/${encodeURIComponent(workflowId)}/feedback`,
+      request,
+      jobId ? { "x-kelpclaw-job-id": jobId } : undefined
+    );
+  },
+
+  decideSuggestion(
+    workflowId: string,
+    feedbackId: string,
+    suggestionId: string,
+    request: WorkflowPlannerSuggestionDecisionRequest
+  ): Promise<WorkflowPlannerSuggestionDecisionResponse> {
+    return postJson(
+      `/api/workflows/${encodeURIComponent(workflowId)}/feedback/${encodeURIComponent(feedbackId)}/suggestions/${encodeURIComponent(suggestionId)}/decision`,
+      request
+    );
+  },
+
+  evaluateDraft(
+    workflowId: string,
+    request: {
+      readonly workflow: WorkflowPlanResponse["workflow"];
+      readonly mockOnly: true;
+      readonly branchId?: string | undefined;
+    },
+    jobId?: string | undefined
+  ): Promise<{ readonly ok: true; readonly evaluation: WorkflowDraftEvaluation }> {
+    return postJson(
+      `/api/workflows/${encodeURIComponent(workflowId)}/evaluate-draft`,
+      request,
+      jobId ? { "x-kelpclaw-job-id": jobId } : undefined
+    );
+  },
+
   approve(workflowId: string, request: WorkflowApproveRequest): Promise<WorkflowApproveResponse> {
     return postJson(`/api/workflows/${encodeURIComponent(workflowId)}/approve`, request);
+  },
+
+  acceptPlan(
+    workflowId: string,
+    request: WorkflowAcceptPlanRequest
+  ): Promise<WorkflowAcceptPlanResponse> {
+    return postJson(`/api/workflows/${encodeURIComponent(workflowId)}/accept-plan`, request);
+  },
+
+  createBranch(
+    workflowId: string,
+    request: WorkflowCreateBranchRequest
+  ): Promise<WorkflowCreateBranchResponse> {
+    return postJson(`/api/workflows/${encodeURIComponent(workflowId)}/branches`, request);
+  },
+
+  listBranches(workflowId: string): Promise<WorkflowListBranchesResponse> {
+    return getJson(`/api/workflows/${encodeURIComponent(workflowId)}/branches`);
+  },
+
+  fetchBranch(workflowId: string, branchId: string): Promise<WorkflowGetBranchResponse> {
+    return getJson(
+      `/api/workflows/${encodeURIComponent(workflowId)}/branches/${encodeURIComponent(branchId)}`
+    );
+  },
+
+  updateBranch(
+    workflowId: string,
+    branchId: string,
+    request: WorkflowUpdateBranchRequest
+  ): Promise<WorkflowUpdateBranchResponse> {
+    return patchJson(
+      `/api/workflows/${encodeURIComponent(workflowId)}/branches/${encodeURIComponent(branchId)}`,
+      request
+    );
+  },
+
+  planBranch(
+    workflowId: string,
+    branchId: string,
+    request: WorkflowBranchPlanRequest,
+    jobId?: string | undefined
+  ): Promise<WorkflowBranchPlanResponse> {
+    return postJson(
+      `/api/workflows/${encodeURIComponent(workflowId)}/branches/${encodeURIComponent(branchId)}/plan`,
+      request,
+      jobId ? { "x-kelpclaw-job-id": jobId } : undefined
+    );
+  },
+
+  repromptBranchNode(
+    workflowId: string,
+    branchId: string,
+    request: WorkflowBranchRepromptNodeRequest
+  ): Promise<WorkflowBranchRepromptNodeResponse> {
+    return postJson(
+      `/api/workflows/${encodeURIComponent(workflowId)}/branches/${encodeURIComponent(branchId)}/reprompt-node`,
+      request
+    );
+  },
+
+  acceptBranchPlan(
+    workflowId: string,
+    branchId: string,
+    request: WorkflowAcceptPlanRequest
+  ): Promise<WorkflowAcceptPlanResponse> {
+    return postJson(
+      `/api/workflows/${encodeURIComponent(workflowId)}/branches/${encodeURIComponent(branchId)}/accept-plan`,
+      request
+    );
+  },
+
+  previewBranchMerge(
+    workflowId: string,
+    sourceBranchId: string,
+    request: WorkflowBranchMergePreviewRequest
+  ): Promise<WorkflowBranchMergePreviewResponse> {
+    return postJson(
+      `/api/workflows/${encodeURIComponent(workflowId)}/branches/${encodeURIComponent(sourceBranchId)}/merge-preview`,
+      request
+    );
+  },
+
+  mergeBranch(
+    workflowId: string,
+    sourceBranchId: string,
+    request: WorkflowBranchMergeRequest
+  ): Promise<WorkflowBranchMergeResponse> {
+    return postJson(
+      `/api/workflows/${encodeURIComponent(workflowId)}/branches/${encodeURIComponent(sourceBranchId)}/merge`,
+      request
+    );
+  },
+
+  fetchReuseCandidates(
+    workflowId: string,
+    branchId: string
+  ): Promise<WorkflowReuseCandidatesResponse> {
+    return getJson(
+      `/api/workflows/${encodeURIComponent(workflowId)}/branches/${encodeURIComponent(branchId)}/reuse-candidates`
+    );
   },
 
   reviewCodegen(
@@ -119,11 +325,41 @@ export const openClawApi = {
     );
   },
 
+  buildCodegen(
+    workflowId: string,
+    nodeId: string,
+    request: {
+      readonly maxIterations?: number;
+      readonly maxWallClockSeconds?: number;
+      readonly maxModelCostUsd?: number;
+      readonly runTestsInDocker?: boolean;
+      readonly branchId?: string | undefined;
+    },
+    jobId?: string | undefined
+  ): Promise<CodegenBuildResponse> {
+    return postJson(
+      `/api/workflows/${encodeURIComponent(workflowId)}/codegen/${encodeURIComponent(nodeId)}/build`,
+      request,
+      jobId ? { "x-kelpclaw-job-id": jobId } : undefined
+    );
+  },
+
+  fetchCodegenEvals(workflowId: string, nodeId: string): Promise<CodegenEvalsResponse> {
+    return getJson(
+      `/api/workflows/${encodeURIComponent(workflowId)}/codegen/${encodeURIComponent(nodeId)}/evals`
+    );
+  },
+
   startRun(
     workflowId: string,
-    request: WorkflowStartRunRequest
+    request: WorkflowStartRunRequest,
+    jobId?: string | undefined
   ): Promise<WorkflowStartRunResponse> {
-    return postJson(`/api/workflows/${encodeURIComponent(workflowId)}/runs`, request);
+    return postJson(
+      `/api/workflows/${encodeURIComponent(workflowId)}/runs`,
+      request,
+      jobId ? { "x-kelpclaw-job-id": jobId } : undefined
+    );
   },
 
   fetchRun(workflowId: string, runId: string): Promise<WorkflowFetchRunResponse> {
@@ -157,15 +393,107 @@ export const openClawApi = {
 
   googleRevoke(): Promise<{ readonly ok: true; readonly deleted: boolean }> {
     return postJson("/api/integrations/google/revoke", {});
+  },
+
+  createJob(request: {
+    readonly type: WorkflowJob["type"];
+    readonly workflowId?: string;
+    readonly revisionId?: string;
+    readonly nodeId?: string;
+    readonly maxAttempts?: number;
+  }): Promise<{ readonly ok: true; readonly job: WorkflowJob }> {
+    return postJson("/api/jobs", request);
+  },
+
+  fetchJob(jobId: string): Promise<{ readonly ok: true; readonly job: WorkflowJob }> {
+    return getJson(`/api/jobs/${encodeURIComponent(jobId)}`);
+  },
+
+  cancelJob(
+    jobId: string,
+    reason: string
+  ): Promise<{ readonly ok: true; readonly job: WorkflowJob }> {
+    return postJson(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, { reason });
+  },
+
+  fetchWorkspace(
+    workspaceId: string
+  ): Promise<{ readonly ok: true; readonly workspace: WorkflowWorkspace }> {
+    return getJson(`/api/workspaces/${encodeURIComponent(workspaceId)}`);
+  },
+
+  fetchDeployments(
+    workflowId: string
+  ): Promise<{ readonly ok: true; readonly deployments: readonly WorkflowDeploymentRecord[] }> {
+    return getJson(`/api/workflows/${encodeURIComponent(workflowId)}/deployments`);
+  },
+
+  fetchActiveDeployments(workflowId: string): Promise<DeploymentActivationSummaryResponse> {
+    return getJson(`/api/workflows/${encodeURIComponent(workflowId)}/deployments/active`);
+  },
+
+  deployWorkflow(
+    workflowId: string,
+    request: {
+      readonly approvedRevisionId: string;
+      readonly kind: WorkflowDeploymentKind;
+      readonly createdBy: string;
+      readonly rollbackPlan: string;
+      readonly branchId?: string | undefined;
+      readonly metadata?: Record<string, unknown>;
+    },
+    jobId?: string | undefined
+  ): Promise<{ readonly ok: true; readonly deployment: WorkflowDeploymentRecord }> {
+    return postJson(
+      `/api/workflows/${encodeURIComponent(workflowId)}/deployments`,
+      request,
+      jobId ? { "x-kelpclaw-job-id": jobId } : undefined
+    );
+  },
+
+  async streamJobEvents(
+    jobId: string,
+    onEvent: (event: WorkflowJobEvent | WorkflowJob) => void
+  ): Promise<void> {
+    const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/events`, {
+      headers: authHeader()
+    });
+    if (!response.ok || !response.body) {
+      await parseJsonResponse(response);
+      return;
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      const chunks = buffer.split("\n\n");
+      buffer = chunks.pop() ?? "";
+      for (const chunk of chunks) {
+        const line = chunk.split("\n").find((candidate) => candidate.startsWith("data: "));
+        if (line) {
+          onEvent(JSON.parse(line.slice("data: ".length)) as WorkflowJobEvent | WorkflowJob);
+        }
+      }
+    }
   }
 };
 
-async function postJson<TResponse>(url: string, body: unknown): Promise<TResponse> {
+async function postJson<TResponse>(
+  url: string,
+  body: unknown,
+  extraHeaders: Record<string, string> | undefined = undefined
+): Promise<TResponse> {
   const response = await fetch(url, {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      ...authHeader()
+      ...authHeader(),
+      ...(extraHeaders ?? {})
     },
     body: JSON.stringify(body)
   });
@@ -176,6 +504,19 @@ async function postJson<TResponse>(url: string, body: unknown): Promise<TRespons
 async function putJson<TResponse>(url: string, body: unknown): Promise<TResponse> {
   const response = await fetch(url, {
     method: "PUT",
+    headers: {
+      "content-type": "application/json",
+      ...authHeader()
+    },
+    body: JSON.stringify(body)
+  });
+
+  return parseJsonResponse<TResponse>(response);
+}
+
+async function patchJson<TResponse>(url: string, body: unknown): Promise<TResponse> {
+  const response = await fetch(url, {
+    method: "PATCH",
     headers: {
       "content-type": "application/json",
       ...authHeader()

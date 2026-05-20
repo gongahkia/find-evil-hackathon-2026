@@ -118,6 +118,82 @@ export interface WorkflowCodegenMetadata {
   readonly llmBacked: boolean;
 }
 
+export type WorkflowGeneratedModuleReuseStatus =
+  | "reuse"
+  | "reuse-with-reeval"
+  | "regenerate"
+  | "blocked-drift";
+
+export type WorkflowGeneratedModuleReuseGate =
+  | "prompt"
+  | "schema"
+  | "runtime"
+  | "sandbox"
+  | "dependency"
+  | "network"
+  | "replay"
+  | "evaluation"
+  | "unresolved-failure";
+
+export interface WorkflowGeneratedModuleSignature {
+  readonly promptHash: string;
+  readonly inputSchemaHash: string;
+  readonly outputSchemaHash: string;
+  readonly runtimeHash: string;
+  readonly sandboxHash: string;
+  readonly dependencyManifestHash: string;
+  readonly replaySeed: string;
+  readonly artifactHash: string;
+}
+
+export interface WorkflowGeneratedModuleReuseDecision {
+  readonly id: string;
+  readonly workflowId: string;
+  readonly branchId: string;
+  readonly nodeId: string;
+  readonly status: WorkflowGeneratedModuleReuseStatus;
+  readonly createdAt: string;
+  readonly sourceBranchId?: string | undefined;
+  readonly sourceDraftRevisionId?: string | undefined;
+  readonly sourceEvalReportId?: string | undefined;
+  readonly signature: WorkflowGeneratedModuleSignature;
+  readonly gates: readonly WorkflowGeneratedModuleReuseGate[];
+  readonly reason: string;
+  readonly artifacts: readonly WorkflowCodegenArtifactRef[];
+}
+
+export type WorkflowAgentRole =
+  | "classifier"
+  | "planner"
+  | "workflow-architect"
+  | "agentic-node-designer"
+  | "coder"
+  | "tester"
+  | "runner"
+  | "fixer"
+  | "evaluator"
+  | "summarizer";
+
+export interface WorkflowAgentBudget {
+  readonly maxIterations: number;
+  readonly maxWallClockSeconds: number;
+  readonly maxModelCostUsd: number;
+  readonly maxDockerRuntimeSeconds: number;
+  readonly maxRetries: number;
+}
+
+export interface WorkflowAgenticNodePolicy {
+  readonly tools: readonly string[];
+  readonly memoryScope: "none" | "node" | "workflow" | "workspace";
+  readonly stopConditions: readonly string[];
+  readonly humanApprovalBoundaries: readonly string[];
+  readonly networkPolicy: WorkflowCodegenSandboxPolicy["network"];
+  readonly allowedHosts: readonly string[];
+  readonly secretRefs: readonly string[];
+  readonly evalContract: JsonRecord;
+  readonly budget: WorkflowAgentBudget;
+}
+
 export interface WorkflowAdapterOperationRef {
   readonly adapterId: string;
   readonly operation: string;
@@ -140,6 +216,7 @@ export interface WorkflowNode {
   readonly adapterOperations?: readonly WorkflowAdapterOperationRef[] | undefined;
   readonly secretRefs?: Readonly<Record<string, string>> | undefined;
   readonly codegen?: WorkflowCodegenMetadata | undefined;
+  readonly agentic?: WorkflowAgenticNodePolicy | undefined;
 }
 
 export interface WorkflowPortRef {
@@ -229,6 +306,9 @@ export const workflowValidationErrorCodes = [
   "WORKFLOW_CODEGEN_DEPENDENCY_POLICY_INVALID",
   "WORKFLOW_CODEGEN_SANDBOX_INVALID",
   "WORKFLOW_CODEGEN_ARTIFACT_DRIFT",
+  "WORKFLOW_CODEGEN_EVAL_REQUIRED",
+  "WORKFLOW_DRAFT_EVALUATION_REQUIRED",
+  "WORKFLOW_DEPLOYMENT_BLOCKED",
   "WORKFLOW_RUNTIME_IMAGE_POLICY_INVALID",
   "WORKFLOW_ADAPTER_DECLARATION_INVALID",
   "WORKFLOW_ADAPTER_SECRET_MISSING",
@@ -248,16 +328,63 @@ export type WorkflowValidationResult =
   | { readonly ok: true; readonly workflow: WorkflowSpec }
   | { readonly ok: false; readonly errors: readonly WorkflowValidationIssue[] };
 
-export type WorkflowDraftRevisionSource = "plan" | "validate" | "reprompt" | "revision";
+export type WorkflowDraftRevisionSource =
+  | "plan"
+  | "plan-accepted"
+  | "branch-fork"
+  | "branch-plan"
+  | "branch-reprompt"
+  | "branch-merge"
+  | "branch-cherry-pick"
+  | "validate"
+  | "reprompt"
+  | "revision";
 
 export interface WorkflowDraftRevision {
   readonly id: string;
   readonly workflowId: string;
+  readonly branchId?: string | undefined;
+  readonly parentDraftRevisionId?: string | undefined;
   readonly revision: number;
   readonly workflow: WorkflowSpec;
   readonly validation: WorkflowValidationResult;
   readonly source: WorkflowDraftRevisionSource;
   readonly createdAt: string;
+}
+
+export type WorkflowBranchStatus = "active" | "archived";
+
+export interface WorkflowBranch {
+  readonly id: string;
+  readonly workflowId: string;
+  readonly name: string;
+  readonly status: WorkflowBranchStatus;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly createdBy: string;
+  readonly parentBranchId?: string | undefined;
+  readonly baseDraftRevisionId: string;
+  readonly headDraftRevisionId: string;
+  readonly acceptedDraftRevisionId?: string | undefined;
+  readonly latestApprovedRevisionId?: string | undefined;
+  readonly latestDraftEvaluationId?: string | undefined;
+  readonly metadata?: JsonRecord | undefined;
+}
+
+export type WorkflowPromptTurnSource = "plan" | "reprompt" | "edit" | "merge" | "cherry-pick";
+
+export interface WorkflowPromptTurn {
+  readonly id: string;
+  readonly workflowId: string;
+  readonly branchId: string;
+  readonly source: WorkflowPromptTurnSource;
+  readonly prompt: string;
+  readonly actor: string;
+  readonly createdAt: string;
+  readonly baseDraftRevisionId?: string | undefined;
+  readonly resultingDraftRevisionId?: string | undefined;
+  readonly route?: WorkflowTaskRoute | undefined;
+  readonly metadata?: JsonRecord | undefined;
 }
 
 export interface WorkflowDiffLine {
@@ -274,6 +401,7 @@ export interface WorkflowSpecDiff {
 export interface WorkflowApprovedRevision {
   readonly id: string;
   readonly workflowId: string;
+  readonly branchId?: string | undefined;
   readonly revision: number;
   readonly approvedBy: string;
   readonly createdAt: string;
@@ -287,21 +415,29 @@ export type WorkflowRunStatus = "queued" | "running" | "succeeded" | "failed";
 export type WorkflowRunEventLevel = "info" | "error";
 export type WorkflowEventSeverity = "debug" | "info" | "warn" | "error" | "critical";
 export type WorkflowObservabilityEventKind =
+  | "task.routing"
   | "prompt.planning"
   | "skill.matching"
   | "draft.edit"
+  | "planner.feedback"
+  | "draft.evaluation"
   | "node.reprompt"
   | "workflow.approval"
+  | "job.lifecycle"
+  | "agent.activity"
+  | "workspace.artifact"
   | "dag.compilation"
   | "node.container"
   | "adapter.call"
   | "codegen.artifact"
   | "delivery.event"
-  | "run.lifecycle";
+  | "run.lifecycle"
+  | "deployment.lifecycle";
 
 export interface WorkflowObservabilityContext {
   readonly workflowId: string;
   readonly revisionId: string;
+  readonly branchId?: string | undefined;
   readonly runId?: string | undefined;
   readonly nodeId?: string | undefined;
   readonly correlationId: string;
@@ -325,6 +461,7 @@ export interface WorkflowRunEvent {
   readonly kind?: WorkflowObservabilityEventKind | undefined;
   readonly workflowId?: string | undefined;
   readonly revisionId?: string | undefined;
+  readonly branchId?: string | undefined;
   readonly runId?: string | undefined;
   readonly correlationId?: string | undefined;
   readonly nodeId?: string | undefined;
@@ -334,6 +471,7 @@ export interface WorkflowRunEvent {
 export interface WorkflowRunRecord {
   readonly id: string;
   readonly workflowId: string;
+  readonly branchId?: string | undefined;
   readonly approvedRevisionId: string;
   readonly revision: number;
   readonly status: WorkflowRunStatus;
@@ -347,8 +485,22 @@ export interface WorkflowRunRecord {
 export type WorkflowAuditAction =
   | "workflow.created"
   | "workflow.edited"
+  | "plan.accepted"
+  | "branch.created"
+  | "branch.updated"
+  | "branch.merged"
+  | "branch.cherry-picked"
+  | "codegen.reused"
   | "workflow.approved"
   | "codegen.reviewed"
+  | "task.routed"
+  | "planner.feedback.created"
+  | "planner.feedback.decided"
+  | "draft.evaluated"
+  | "job.created"
+  | "agent.ran"
+  | "workspace.created"
+  | "deployment.created"
   | "secret.referenced"
   | "container.ran"
   | "adapter.called"
@@ -392,16 +544,393 @@ export interface WorkflowAuditRecord extends WorkflowObservabilityContext {
 export interface WorkflowArtifactManifestRecord {
   readonly id: string;
   readonly workflowId: string;
+  readonly branchId?: string | undefined;
   readonly revisionId: string;
   readonly createdAt: string;
   readonly artifacts: readonly WorkflowCodegenArtifactRef[];
   readonly manifestChecksum: string;
 }
 
+export type WorkflowTaskRouteKind =
+  | "deterministic"
+  | "adapter"
+  | "codegen"
+  | "agentic"
+  | "deployment";
+
+export interface WorkflowRetryBudget {
+  readonly maxAttempts: number;
+  readonly maxCostUsd: number;
+}
+
+export interface WorkflowModelRequirement {
+  readonly mode: "none" | "deterministic" | "live";
+  readonly role: WorkflowAgentRole;
+  readonly provider?: string | undefined;
+  readonly model?: string | undefined;
+  readonly retryBudget: WorkflowRetryBudget;
+}
+
+export interface WorkflowModelInvocationRecord {
+  readonly id: string;
+  readonly role: WorkflowAgentRole;
+  readonly inputSummary: string;
+  readonly outputArtifact: string;
+  readonly provider: string;
+  readonly model: string;
+  readonly determinismExpectation: "deterministic" | "bounded" | "non-deterministic";
+  readonly retryBudget: WorkflowRetryBudget;
+  readonly correlationId: string;
+  readonly createdAt: string;
+  readonly durationMs?: number | undefined;
+  readonly durationApiMs?: number | undefined;
+  readonly inputTokens?: number | undefined;
+  readonly outputTokens?: number | undefined;
+  readonly cacheReadInputTokens?: number | undefined;
+  readonly cacheCreationInputTokens?: number | undefined;
+  readonly totalTokens?: number | undefined;
+  readonly costUsd?: number | undefined;
+  readonly modelUsage?: JsonRecord | undefined;
+}
+
+export interface WorkflowTaskRoute {
+  readonly route: WorkflowTaskRouteKind;
+  readonly rationale: string;
+  readonly requiredModel: WorkflowModelRequirement;
+  readonly expectedNodeKinds: readonly WorkflowNodeKind[];
+  readonly dockerSandboxRequired: boolean;
+  readonly draftTestsRequired: boolean;
+  readonly productionDeterministic: boolean;
+  readonly modelInvocations: readonly WorkflowModelInvocationRecord[];
+}
+
+export type WorkflowGraphChangeKind =
+  | "node.added"
+  | "node.removed"
+  | "node.moved"
+  | "node.edited"
+  | "edge.added"
+  | "edge.removed"
+  | "edge.reconnected";
+
+export interface WorkflowGraphChange {
+  readonly id: string;
+  readonly kind: WorkflowGraphChangeKind;
+  readonly elementId: string;
+  readonly path: readonly (string | number)[];
+  readonly before?: JsonValue | undefined;
+  readonly after?: JsonValue | undefined;
+}
+
+export interface WorkflowGraphDiff {
+  readonly id: string;
+  readonly workflowId: string;
+  readonly branchId?: string | undefined;
+  readonly baseRevision: number;
+  readonly editedRevision: number;
+  readonly createdAt: string;
+  readonly summary: readonly string[];
+  readonly changes: readonly WorkflowGraphChange[];
+  readonly validation: WorkflowValidationResult;
+}
+
+export type WorkflowPlannerSuggestionStatus = "suggested" | "accepted" | "rejected";
+export type WorkflowPlannerConflictKind = "safe" | "invalid" | "under-specified" | "needs-repair";
+
+export interface WorkflowPlannerSuggestion {
+  readonly id: string;
+  readonly status: WorkflowPlannerSuggestionStatus;
+  readonly conflict: WorkflowPlannerConflictKind;
+  readonly target: {
+    readonly kind: "workflow" | "node" | "edge";
+    readonly id?: string | undefined;
+  };
+  readonly title: string;
+  readonly message: string;
+  readonly patch?: JsonRecord | undefined;
+  readonly issues: readonly WorkflowValidationIssue[];
+}
+
+export interface WorkflowPlannerFeedback {
+  readonly id: string;
+  readonly workflowId: string;
+  readonly branchId?: string | undefined;
+  readonly graphDiffId: string;
+  readonly route: WorkflowTaskRoute;
+  readonly createdAt: string;
+  readonly status: "ready" | "warnings" | "blocked";
+  readonly suggestions: readonly WorkflowPlannerSuggestion[];
+  readonly issues: readonly WorkflowValidationIssue[];
+}
+
+export interface WorkflowFeedbackRequest {
+  readonly baseWorkflow: WorkflowSpec;
+  readonly editedWorkflow: WorkflowSpec;
+  readonly prompt?: string | undefined;
+}
+
+export interface WorkflowFeedbackResponse {
+  readonly ok: true;
+  readonly graphDiff: WorkflowGraphDiff;
+  readonly feedback: WorkflowPlannerFeedback;
+}
+
+export interface WorkflowPlannerSuggestionDecisionRequest {
+  readonly suggestionId: string;
+  readonly decision: "accepted" | "rejected";
+}
+
+export interface WorkflowPlannerSuggestionDecisionResponse {
+  readonly ok: true;
+  readonly feedback: WorkflowPlannerFeedback;
+}
+
+export type WorkflowBranchMergeMode = "merge" | "cherry-pick";
+export type WorkflowBranchMergeStatus = "clean" | "conflicts" | "blocked" | "applied";
+export type WorkflowBranchMergeConflictKind =
+  | "both-edited"
+  | "delete-edit"
+  | "add-add-id-collision"
+  | "missing-edge-endpoint"
+  | "schema-drift"
+  | "runtime-drift"
+  | "codegen-drift"
+  | "validation-blocked";
+
+export interface WorkflowBranchMergeConflict {
+  readonly id: string;
+  readonly kind: WorkflowBranchMergeConflictKind;
+  readonly elementKind: "workflow" | "node" | "edge";
+  readonly elementId?: string | undefined;
+  readonly path: readonly (string | number)[];
+  readonly message: string;
+  readonly baseValue?: JsonValue | undefined;
+  readonly sourceValue?: JsonValue | undefined;
+  readonly targetValue?: JsonValue | undefined;
+}
+
+export interface WorkflowBranchMergeResolution {
+  readonly conflictId: string;
+  readonly choice: "source" | "target" | "manual";
+  readonly value?: JsonValue | undefined;
+}
+
+export interface WorkflowBranchMergePreview {
+  readonly id: string;
+  readonly workflowId: string;
+  readonly sourceBranchId: string;
+  readonly targetBranchId: string;
+  readonly mode: WorkflowBranchMergeMode;
+  readonly status: WorkflowBranchMergeStatus;
+  readonly createdAt: string;
+  readonly baseDraftRevisionId: string;
+  readonly sourceHeadDraftRevisionId: string;
+  readonly targetHeadDraftRevisionId: string;
+  readonly graphDiff: WorkflowGraphDiff;
+  readonly conflicts: readonly WorkflowBranchMergeConflict[];
+  readonly mergedWorkflow?: WorkflowSpec | undefined;
+  readonly validation: WorkflowValidationResult;
+  readonly summary: readonly string[];
+}
+
+export interface WorkflowBranchMergeRecord extends WorkflowBranchMergePreview {
+  readonly status: WorkflowBranchMergeStatus;
+  readonly appliedAt?: string | undefined;
+  readonly appliedBy?: string | undefined;
+  readonly mergedDraftRevisionId?: string | undefined;
+  readonly resolutions: readonly WorkflowBranchMergeResolution[];
+}
+
+export type WorkflowJobType =
+  | "plan.workflow"
+  | "feedback.graph"
+  | "evaluate.draft"
+  | "build.codegen-node"
+  | "test.codegen-node"
+  | "approve.workflow"
+  | "run.workflow"
+  | "deploy.workflow"
+  | "smoke.integration";
+
+export type WorkflowJobStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled";
+
+export interface WorkflowJobRetryMetadata {
+  readonly attempt: number;
+  readonly maxAttempts: number;
+  readonly retryable: boolean;
+}
+
+export interface WorkflowJobEvent {
+  readonly id: string;
+  readonly jobId: string;
+  readonly timestamp: string;
+  readonly level: WorkflowRunEventLevel;
+  readonly message: string;
+  readonly kind: WorkflowObservabilityEventKind;
+  readonly metadata?: JsonRecord | undefined;
+}
+
+export interface WorkflowJob {
+  readonly id: string;
+  readonly type: WorkflowJobType;
+  readonly status: WorkflowJobStatus;
+  readonly workflowId?: string | undefined;
+  readonly branchId?: string | undefined;
+  readonly revisionId?: string | undefined;
+  readonly nodeId?: string | undefined;
+  readonly workspaceId?: string | undefined;
+  readonly correlationId: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly startedAt?: string | undefined;
+  readonly claimedAt?: string | undefined;
+  readonly workerId?: string | undefined;
+  readonly finishedAt?: string | undefined;
+  readonly retry: WorkflowJobRetryMetadata;
+  readonly cancelledAt?: string | undefined;
+  readonly cancellationReason?: string | undefined;
+  readonly events: readonly WorkflowJobEvent[];
+  readonly payload?: JsonRecord | undefined;
+  readonly result?: JsonRecord | undefined;
+  readonly error?: string | undefined;
+}
+
+export type WorkflowWorkspaceMountRole =
+  | "workflow-architect"
+  | "coder"
+  | "tester"
+  | "runner"
+  | "fixer"
+  | "evaluator";
+
+export interface WorkflowWorkspaceMount {
+  readonly role: WorkflowWorkspaceMountRole;
+  readonly path: string;
+  readonly mode: "ro" | "rw";
+}
+
+export interface WorkflowWorkspaceFileHash {
+  readonly path: string;
+  readonly checksum: string;
+}
+
+export interface WorkflowWorkspace {
+  readonly id: string;
+  readonly jobId: string;
+  readonly workflowId: string;
+  readonly branchId?: string | undefined;
+  readonly revisionId?: string | undefined;
+  readonly draftId?: string | undefined;
+  readonly rootPath: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly mountedAgents: readonly WorkflowWorkspaceMountRole[];
+  readonly mounts: readonly WorkflowWorkspaceMount[];
+  readonly filesCreated: readonly string[];
+  readonly fileHashes: readonly WorkflowWorkspaceFileHash[];
+  readonly artifactsProduced: readonly WorkflowCodegenArtifactRef[];
+  readonly logs: readonly string[];
+  readonly logPaths: readonly string[];
+  readonly testReports: readonly string[];
+  readonly retentionPolicy: "ephemeral" | "retain-on-failure" | "retain";
+  readonly retentionStatus: "active" | "retained" | "eligible-for-cleanup";
+}
+
+export type WorkflowDraftEvaluationFindingSeverity = "info" | "warn" | "error";
+
+export interface WorkflowDraftEvaluationFinding {
+  readonly id: string;
+  readonly severity: WorkflowDraftEvaluationFindingSeverity;
+  readonly target: {
+    readonly kind: "workflow" | "node" | "edge" | "artifact";
+    readonly id?: string | undefined;
+  };
+  readonly message: string;
+  readonly issues: readonly WorkflowValidationIssue[];
+}
+
+export interface WorkflowDraftEvaluation {
+  readonly id: string;
+  readonly workflowId: string;
+  readonly branchId?: string | undefined;
+  readonly draftRevisionId: string;
+  readonly jobId?: string | undefined;
+  readonly status: "passed" | "failed";
+  readonly readyForApproval: boolean;
+  readonly createdAt: string;
+  readonly finishedAt: string;
+  readonly mode: "draft";
+  readonly mockOnly: true;
+  readonly liveProviderCalls: 0;
+  readonly findings: readonly WorkflowDraftEvaluationFinding[];
+  readonly events: readonly WorkflowRunEvent[];
+  readonly suggestions: readonly WorkflowPlannerSuggestion[];
+}
+
+export interface GeneratedNodeTestReport {
+  readonly id: string;
+  readonly workflowId: string;
+  readonly branchId?: string | undefined;
+  readonly nodeId: string;
+  readonly jobId: string;
+  readonly status: "passed" | "failed";
+  readonly createdAt: string;
+  readonly finishedAt: string;
+  readonly testFiles: readonly WorkflowCodegenArtifactRef[];
+  readonly resultArtifacts: readonly WorkflowCodegenArtifactRef[];
+  readonly logs: readonly string[];
+  readonly failureMessage?: string | undefined;
+}
+
+export interface GeneratedNodeEvalReport {
+  readonly id: string;
+  readonly workflowId: string;
+  readonly branchId?: string | undefined;
+  readonly nodeId: string;
+  readonly jobId: string;
+  readonly status: "passed" | "failed";
+  readonly createdAt: string;
+  readonly finishedAt: string;
+  readonly designSpec: WorkflowCodegenArtifactRef;
+  readonly testReportId: string;
+  readonly schemaValid: boolean;
+  readonly securityValid: boolean;
+  readonly replayValid: boolean;
+  readonly dependencyPolicyValid: boolean;
+  readonly fixHistory: readonly string[];
+  readonly findings: readonly WorkflowDraftEvaluationFinding[];
+}
+
+export type WorkflowDeploymentKind =
+  | "schedule.activation"
+  | "skill.publication"
+  | "integration.configuration"
+  | "runner.configuration"
+  | "workflow.bundle"
+  | "generated.service";
+
+export interface WorkflowDeploymentRecord {
+  readonly id: string;
+  readonly workflowId: string;
+  readonly branchId?: string | undefined;
+  readonly approvedRevisionId: string;
+  readonly draftEvaluationId: string;
+  readonly kind: WorkflowDeploymentKind;
+  readonly status: "ready" | "blocked" | "deployed" | "rolled-back";
+  readonly createdAt: string;
+  readonly createdBy: string;
+  readonly requiredIntegrations: readonly string[];
+  readonly secretRefs: readonly string[];
+  readonly rollbackPlan: string;
+  readonly auditRecordId: string;
+  readonly metadata: JsonRecord;
+}
+
 export interface WorkflowPlanRequest {
   readonly prompt: string;
   readonly currentWorkflow?: WorkflowSpec | undefined;
   readonly preserveNodeIds?: readonly string[] | undefined;
+  readonly forceDeterministic?: boolean | undefined;
 }
 
 export interface WorkflowPlanResponse {
@@ -409,6 +938,52 @@ export interface WorkflowPlanResponse {
   readonly workflow: WorkflowSpec;
   readonly draftRevision: WorkflowDraftRevision;
   readonly validation: WorkflowValidationResult;
+  readonly route: WorkflowTaskRoute;
+}
+
+export interface WorkflowCreateBranchRequest {
+  readonly name: string;
+  readonly createdBy: string;
+  readonly fromBranchId?: string | undefined;
+  readonly fromDraftRevisionId?: string | undefined;
+}
+
+export interface WorkflowCreateBranchResponse {
+  readonly ok: true;
+  readonly branch: WorkflowBranch;
+  readonly draftRevision: WorkflowDraftRevision;
+}
+
+export interface WorkflowListBranchesResponse {
+  readonly ok: true;
+  readonly branches: readonly WorkflowBranch[];
+}
+
+export interface WorkflowGetBranchResponse {
+  readonly ok: true;
+  readonly branch: WorkflowBranch;
+  readonly headDraftRevision: WorkflowDraftRevision;
+  readonly promptTurns: readonly WorkflowPromptTurn[];
+}
+
+export interface WorkflowUpdateBranchRequest {
+  readonly name?: string | undefined;
+  readonly status?: WorkflowBranchStatus | undefined;
+  readonly updatedBy: string;
+}
+
+export interface WorkflowUpdateBranchResponse {
+  readonly ok: true;
+  readonly branch: WorkflowBranch;
+}
+
+export interface WorkflowBranchPlanRequest extends WorkflowPlanRequest {
+  readonly actor?: string | undefined;
+}
+
+export interface WorkflowBranchPlanResponse extends WorkflowPlanResponse {
+  readonly branch: WorkflowBranch;
+  readonly promptTurn: WorkflowPromptTurn;
 }
 
 export interface WorkflowRepromptNodeRequest {
@@ -427,6 +1002,15 @@ export interface WorkflowRepromptNodeResponse {
   readonly diff: WorkflowSpecDiff;
 }
 
+export interface WorkflowBranchRepromptNodeRequest extends WorkflowRepromptNodeRequest {
+  readonly actor?: string | undefined;
+}
+
+export interface WorkflowBranchRepromptNodeResponse extends WorkflowRepromptNodeResponse {
+  readonly branch: WorkflowBranch;
+  readonly promptTurn: WorkflowPromptTurn;
+}
+
 export interface WorkflowValidateRequest {
   readonly workflow: WorkflowSpec;
 }
@@ -441,6 +1025,51 @@ export interface WorkflowValidateResponse {
 export interface WorkflowApproveRequest {
   readonly workflow: WorkflowSpec;
   readonly approvedBy: string;
+  readonly branchId?: string | undefined;
+}
+
+export interface WorkflowAcceptPlanRequest {
+  readonly workflow: WorkflowSpec;
+  readonly acceptedBy: string;
+}
+
+export interface WorkflowAcceptPlanResponse {
+  readonly ok: true;
+  readonly workflowId: string;
+  readonly draftRevisionId: string;
+  readonly workflow: WorkflowSpec;
+  readonly draftRevision: WorkflowDraftRevision;
+  readonly validation: WorkflowValidationResult;
+}
+
+export interface WorkflowBranchMergePreviewRequest {
+  readonly targetBranchId: string;
+  readonly mode?: WorkflowBranchMergeMode | undefined;
+  readonly cherryPickChangeIds?: readonly string[] | undefined;
+}
+
+export interface WorkflowBranchMergePreviewResponse {
+  readonly ok: true;
+  readonly preview: WorkflowBranchMergePreview;
+}
+
+export interface WorkflowBranchMergeRequest extends WorkflowBranchMergePreviewRequest {
+  readonly appliedBy: string;
+  readonly resolutions: readonly WorkflowBranchMergeResolution[];
+}
+
+export interface WorkflowBranchMergeResponse {
+  readonly ok: true;
+  readonly merge: WorkflowBranchMergeRecord;
+  readonly branch: WorkflowBranch;
+  readonly draftRevision: WorkflowDraftRevision;
+  readonly workflow: WorkflowSpec;
+  readonly validation: WorkflowValidationResult;
+}
+
+export interface WorkflowReuseCandidatesResponse {
+  readonly ok: true;
+  readonly decisions: readonly WorkflowGeneratedModuleReuseDecision[];
 }
 
 export interface WorkflowApproveResponse {
@@ -454,6 +1083,7 @@ export interface WorkflowApproveResponse {
 
 export interface WorkflowStartRunRequest {
   readonly approvedRevisionId: string;
+  readonly branchId?: string | undefined;
 }
 
 export interface WorkflowStartRunResponse {
