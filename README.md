@@ -16,6 +16,7 @@ OpenClaw is the editable workflow planner. NanoClaw is the deterministic runtime
 | `packages/codegen`        | Generated artifact contracts, checksums, and replay policy helpers                       |
 | `packages/adapters`       | Live provider adapters, generic connectors, and deterministic test mocks                 |
 | `packages/web-intel`      | Governed Exa/TinyFish web search, fetch, answer, browser, and evidence normalization     |
+| `packages/evidence`       | Piranesi-derived local evidence vault, normalized findings, custody, QA, and retest diff |
 | `packages/testing`        | Shared fixtures, mock providers, and deterministic execution harnesses                   |
 
 ## Development
@@ -45,6 +46,7 @@ Quickstart, deployment notes for durable SQLite mode, Docker Compose, and produc
 [`docs/skill-governance-demo.md`](docs/skill-governance-demo.md),
 [`docs/security-review-demo.md`](docs/security-review-demo.md),
 [`docs/agent-inventory.md`](docs/agent-inventory.md),
+[`docs/piranesi-integration.md`](docs/piranesi-integration.md),
 [`docs/web-intel.md`](docs/web-intel.md), and
 [`docs/production-readiness.md`](docs/production-readiness.md).
 
@@ -106,6 +108,12 @@ $ kelp-claw replay-diff --recorded --skill ./SKILL.md --input input.json --agent
 $ kelp-claw web search "Singapore agentic AI governance" --provider exa --policy sg-web-research --out .kelpclaw/web-evidence/sg-ai
 $ kelp-claw web fetch https://example.com/source --provider tinyfish --out .kelpclaw/web-evidence/source
 $ kelp-claw export-audit-bundle <runId> --include-web-evidence .kelpclaw/web-evidence/sg-ai --include-governance
+$ kelp-claw evidence init --workspace .kelpclaw/evidence --client "Example Client" --project "Agent Review"
+$ kelp-claw evidence add --workspace .kelpclaw/evidence --file operator-note.txt --kind note --title "Operator note"
+$ kelp-claw evidence import-sarif --workspace .kelpclaw/evidence findings.sarif
+$ kelp-claw evidence sign --workspace .kelpclaw/evidence
+$ kelp-claw evidence verify --workspace .kelpclaw/evidence
+$ kelp-claw export-audit-bundle <runId> --include-evidence .kelpclaw/evidence --include-governance
 $ kelp-claw inventory scan --root . --policy sg-agentic-ai-baseline --out .kelpclaw/inventory/agent-inventory.json
 $ kelp-claw inventory graph --root . --format markdown --out .kelpclaw/inventory/permissions.md
 $ kelp-claw inventory coverage --root . --format markdown --fail-on high --out .kelpclaw/inventory/coverage.md
@@ -117,7 +125,9 @@ $ kelp-claw inventory coverage --root . --format markdown --fail-on high --out .
 
 `kelp-claw web` adds governed Exa/TinyFish web intelligence. `search`, `fetch`, `answer`, and `research` evaluate a policy pack before the provider call, normalize sources into KelpClaw web evidence, hash source content, redact obvious secrets and emails, and optionally write `web-evidence.json`, `web-events.jsonl`, `web-bom.json`, and `web-evidence.html`. Set `EXA_API_KEY` and/or `TINYFISH_API_KEY` for live calls. Attach the evidence to `governance report` or `export-audit-bundle` with `--include-web-evidence <dir-or-json>`.
 
-`kelp-claw inventory` scans a repository for SKILL.md files, recorded runs, signed audit bundles, governed web evidence, KelpClaw GitHub Action workflows, and MCP web gateways. `inventory graph` renders a permission graph of skills, tools, secrets, policies, bundles, attestations, and web evidence; `inventory coverage` reports missing signed bundles, missing attestations, networked skills without web evidence, and CI coverage gaps.
+`kelp-claw evidence` ports the useful Piranesi concepts into KelpClaw: a local evidence vault, normalized findings, SARIF import, append-only audit log, chain-of-custody manifest, delivery QA, and retest diff. Attach it to governance reports or audit bundles with `--include-evidence <workspace>`.
+
+`kelp-claw inventory` scans a repository for SKILL.md files, recorded runs, signed audit bundles, governed web evidence, evidence workspaces, KelpClaw GitHub Action workflows, and MCP web gateways. `inventory graph` renders a permission graph of skills, tools, secrets, policies, bundles, attestations, web evidence, and evidence workspaces; `inventory coverage` reports missing signed bundles, missing attestations, networked skills without web evidence, unsigned evidence workspaces, and CI coverage gaps.
 
 Built-in policy packs are available without writing YAML on day one:
 
