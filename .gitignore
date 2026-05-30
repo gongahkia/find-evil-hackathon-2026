@@ -12,3 +12,5 @@ packages/*/dist
 .playwright-cli
 .kelpclaw
 .env
+CLAUDE.md
+AGENTS.md
