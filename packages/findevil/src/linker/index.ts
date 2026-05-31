@@ -8,8 +8,16 @@ import {
   matchEventLogServiceInstall,
   parseEvtxJson
 } from "./eventlog.js";
+import { matchMftFileCreate, matchMftFileDelete, matchMftFileModify, parseMftJson } from "./mft.js";
 import { matchPcapNetworkConnection, parseFlowSummaryJson } from "./pcap.js";
 import { matchByExecutable, parsePrefetchOutput, prefetchEntryToEvidenceRef } from "./prefetch.js";
+import {
+  matchRegistryRunKey,
+  matchRegistryScheduledTask,
+  matchRegistryService,
+  matchRegistryShimCache,
+  parseRegistryJson
+} from "./registry.js";
 import {
   matchByShimcachePath,
   parseShimcacheOutput,
@@ -18,6 +26,14 @@ import {
 import { matchBySrumApp, parseSrumOutput, srumEntryToEvidenceRef } from "./srum.js";
 import { matchSysmonNetworkConnect, matchSysmonProcessCreate, parseSysmonJson } from "./sysmon.js";
 import { matchClaimToRows, parseTimelineCsv, timelineMatchToEvidenceRef } from "./timeline.js";
+import {
+  matchVolatilityCmdline,
+  matchVolatilityMalfind,
+  matchVolatilityNetscan,
+  matchVolatilityPslist,
+  parseVolatilityJson
+} from "./memory.js";
+import { matchYaraExecutionContext, matchYaraFamilyHit, parseYaraJson } from "./yara.js";
 
 export { parseAmcacheOutput, matchByPathOrHash } from "./amcache.js";
 export {
@@ -28,12 +44,28 @@ export {
   parseEvtxJson
 } from "./eventlog.js";
 export { hashEvidenceRow } from "./hashing.js";
+export { parseMftJson, matchMftFileCreate, matchMftFileModify, matchMftFileDelete } from "./mft.js";
 export { parseFlowSummaryJson, matchPcapNetworkConnection } from "./pcap.js";
 export { parsePrefetchOutput, matchByExecutable } from "./prefetch.js";
+export {
+  matchRegistryRunKey,
+  matchRegistryScheduledTask,
+  matchRegistryService,
+  matchRegistryShimCache,
+  parseRegistryJson
+} from "./registry.js";
 export { parseShimcacheOutput, matchByShimcachePath } from "./shimcache.js";
 export { parseSrumOutput, matchBySrumApp } from "./srum.js";
 export { parseSysmonJson, matchSysmonNetworkConnect, matchSysmonProcessCreate } from "./sysmon.js";
 export { parseTimelineCsv, matchClaimToRows } from "./timeline.js";
+export {
+  matchVolatilityCmdline,
+  matchVolatilityMalfind,
+  matchVolatilityNetscan,
+  matchVolatilityPslist,
+  parseVolatilityJson
+} from "./memory.js";
+export { parseYaraJson, matchYaraExecutionContext, matchYaraFamilyHit } from "./yara.js";
 
 const programExecutionProof = [
   "prefetch_entry",
@@ -41,17 +73,21 @@ const programExecutionProof = [
   "shimcache_indicator",
   "srum_network_activity",
   "sysmon_process_create",
-  "security_4688_process_create"
+  "security_4688_process_create",
+  "volatility-pslist",
+  "volatility-malfind"
 ] as const;
 const persistenceProof = [
   "registry-run-key",
+  "registry-service",
   "scheduled-task",
   "service-create",
   "security_4698_scheduled_task",
   "security_4702_scheduled_task",
   "system_7045_service_create"
 ] as const;
-const networkProof = ["netflow-or-pcap"] as const;
+const networkProof = ["netflow-or-pcap", "volatility-netscan"] as const;
+const malwareIdentificationProof = ["yara_hit"] as const;
 
 export function linkEvidence(claim: Claim, caseDir: string): Claim {
   const files = listCaseFiles(caseDir);
@@ -62,25 +98,33 @@ export function linkEvidence(claim: Claim, caseDir: string): Claim {
       additions.push(...linkPrefetchEvidence(claim, caseDir, files));
       additions.push(...linkAmcacheEvidence(claim, caseDir, files));
       additions.push(...linkShimcacheEvidence(claim, caseDir, files));
+      additions.push(...linkRegistryProgramExecutionEvidence(claim, caseDir, files));
       additions.push(...linkSrumEvidence(claim, caseDir, files));
       additions.push(...linkSysmonProcessCreateEvidence(claim, caseDir, files));
       additions.push(...linkEventLogProcessCreateEvidence(claim, caseDir, files));
+      additions.push(...linkVolatilityProgramExecutionEvidence(claim, caseDir, files));
+      additions.push(...linkYaraExecutionContextEvidence(claim, caseDir, files));
       break;
     case "network_connection":
       additions.push(...linkPcapEvidence(claim, caseDir, files));
       additions.push(...linkTimelineEvidence(claim, caseDir, files));
       additions.push(...linkSysmonNetworkConnectEvidence(claim, caseDir, files));
+      additions.push(...linkVolatilityNetscanEvidence(claim, caseDir, files));
       break;
     case "file_presence":
       additions.push(...linkTimelineEvidence(claim, caseDir, files));
       break;
     case "persistence":
       additions.push(...linkTimelineEvidence(claim, caseDir, files));
+      additions.push(...linkRegistryPersistenceEvidence(claim, caseDir, files));
       additions.push(...linkEventLogPersistenceEvidence(claim, caseDir, files));
       break;
     case "timeline_ordering":
     case "user_activity":
       additions.push(...linkTimelineEvidence(claim, caseDir, files));
+      break;
+    case "malware_identification":
+      additions.push(...linkYaraFamilyHitEvidence(claim, caseDir, files));
       break;
     default:
       additions.push(...linkTimelineEvidence(claim, caseDir, files));
@@ -91,8 +135,12 @@ export function linkEvidence(claim: Claim, caseDir: string): Claim {
       additions.push(...linkSysmonProcessCreateEvidence(claim, caseDir, files));
       additions.push(...linkEventLogProcessCreateEvidence(claim, caseDir, files));
       additions.push(...linkSysmonNetworkConnectEvidence(claim, caseDir, files));
+      additions.push(...linkVolatilityProgramExecutionEvidence(claim, caseDir, files));
+      additions.push(...linkVolatilityNetscanEvidence(claim, caseDir, files));
+      additions.push(...linkYaraFamilyHitEvidence(claim, caseDir, files));
       break;
   }
+  additions.push(...linkMftEvidence(claim, caseDir, files));
 
   const evidenceRefs = dedupeEvidenceRefs([...claim.evidenceRefs, ...additions]);
   return claimSchema.parse({
@@ -184,6 +232,35 @@ function linkPcapEvidence(claim: Claim, caseDir: string, files: readonly string[
     );
 }
 
+function linkRegistryProgramExecutionEvidence(
+  claim: Claim,
+  caseDir: string,
+  files: readonly string[]
+): EvidenceRef[] {
+  return files
+    .filter((file) => isRegistryFile(file))
+    .flatMap((file) =>
+      matchRegistryShimCache(claim, parseRegistryJson(file, relativeArtifact(caseDir, file)))
+    );
+}
+
+function linkRegistryPersistenceEvidence(
+  claim: Claim,
+  caseDir: string,
+  files: readonly string[]
+): EvidenceRef[] {
+  return files
+    .filter((file) => isRegistryFile(file))
+    .flatMap((file) => {
+      const records = parseRegistryJson(file, relativeArtifact(caseDir, file));
+      return [
+        ...matchRegistryRunKey(claim, records),
+        ...matchRegistryService(claim, records),
+        ...matchRegistryScheduledTask(claim, records)
+      ];
+    });
+}
+
 function linkSysmonProcessCreateEvidence(
   claim: Claim,
   caseDir: string,
@@ -236,6 +313,78 @@ function linkEventLogPersistenceEvidence(
         ...matchEventLogScheduledTask(claim, records)
       ];
     });
+}
+
+function linkMftEvidence(claim: Claim, caseDir: string, files: readonly string[]): EvidenceRef[] {
+  return files
+    .filter((file) => isMftFile(file))
+    .flatMap((file) => {
+      const records = parseMftJson(file, relativeArtifact(caseDir, file));
+      return [
+        ...(shouldLinkMftCreate(claim) ? matchMftFileCreate(claim, records) : []),
+        ...(shouldLinkMftModify(claim) ? matchMftFileModify(claim, records) : []),
+        ...(shouldLinkMftDelete(claim) ? matchMftFileDelete(claim, records) : [])
+      ];
+    });
+}
+
+function linkVolatilityProgramExecutionEvidence(
+  claim: Claim,
+  caseDir: string,
+  files: readonly string[]
+): EvidenceRef[] {
+  return files
+    .filter((file) => isVolatilityFile(file))
+    .flatMap((file) => {
+      const records = parseVolatilityJson(file);
+      return [
+        ...matchVolatilityPslist(claim, records),
+        ...matchVolatilityMalfind(claim, records),
+        ...matchVolatilityCmdline(claim, records)
+      ].map((ref) => ({
+        ...ref,
+        artifact: relativeArtifact(caseDir, ref.artifact)
+      }));
+    });
+}
+
+function linkVolatilityNetscanEvidence(
+  claim: Claim,
+  caseDir: string,
+  files: readonly string[]
+): EvidenceRef[] {
+  return files
+    .filter((file) => isVolatilityFile(file))
+    .flatMap((file) =>
+      matchVolatilityNetscan(claim, parseVolatilityJson(file)).map((ref) => ({
+        ...ref,
+        artifact: relativeArtifact(caseDir, ref.artifact)
+      }))
+    );
+}
+
+function linkYaraFamilyHitEvidence(
+  claim: Claim,
+  caseDir: string,
+  files: readonly string[]
+): EvidenceRef[] {
+  return files
+    .filter((file) => isYaraFile(file))
+    .flatMap((file) =>
+      matchYaraFamilyHit(claim, parseYaraJson(file, relativeArtifact(caseDir, file)))
+    );
+}
+
+function linkYaraExecutionContextEvidence(
+  claim: Claim,
+  caseDir: string,
+  files: readonly string[]
+): EvidenceRef[] {
+  return files
+    .filter((file) => isYaraFile(file))
+    .flatMap((file) =>
+      matchYaraExecutionContext(claim, parseYaraJson(file, relativeArtifact(caseDir, file)))
+    );
 }
 
 function listCaseFiles(caseDir: string): string[] {
@@ -315,6 +464,53 @@ function isEventLogFile(path: string): boolean {
   );
 }
 
+function isMftFile(path: string): boolean {
+  const lower = path.toLowerCase();
+  return /\.(?:json|jsonl|ndjson)$/u.test(lower) && /(?:^|[/\\])(?:\$?mft|mftecmd)/u.test(lower);
+}
+
+function shouldLinkMftCreate(claim: Claim): boolean {
+  return (
+    claim.type === "program_execution" ||
+    claim.type === "persistence" ||
+    claim.type === "file_presence" ||
+    /\b(?:creat(?:e|ed|ion)|dropped|downloaded|written|present|exists|appeared)\b/iu.test(
+      claim.text
+    )
+  );
+}
+
+function shouldLinkMftModify(claim: Claim): boolean {
+  return /\b(?:modif(?:y|ied|ication)|tamper(?:ed|ing)?|updated|overwrote|changed)\b/iu.test(
+    claim.text
+  );
+}
+
+function shouldLinkMftDelete(claim: Claim): boolean {
+  return /\b(?:delet(?:e|ed|ion)|removed|unlinked)\b/iu.test(claim.text);
+}
+
+function isVolatilityFile(path: string): boolean {
+  const lower = path.toLowerCase();
+  return (
+    /\.(?:json|jsonl|ndjson|log)$/u.test(lower) &&
+    /(?:volatility|vol3|pslist|netscan|malfind|cmdline)/u.test(lower)
+  );
+}
+
+function isYaraFile(path: string): boolean {
+  const lower = path.toLowerCase();
+  return lower.includes("yara") && /\.(?:json|jsonl|ndjson|log)$/u.test(lower);
+}
+
+function isRegistryFile(path: string): boolean {
+  const lower = path.toLowerCase();
+  return (
+    /\.(?:csv|json|jsonl|ndjson)$/u.test(lower) &&
+    /(?:registry|reg[-_ ]?|recmd|regripper|ntuser|appcompatcache|taskcache|runkeys?)/u.test(lower)
+  );
+}
+
 function relativeArtifact(caseDir: string, path: string): string {
   return relative(caseDir, path).split(sep).join("/");
 }
@@ -340,7 +536,9 @@ function missingEvidenceFor(
         ? persistenceProof
         : type === "network_connection"
           ? networkProof
-          : [];
+          : type === "malware_identification"
+            ? malwareIdentificationProof
+            : [];
   if (required.length === 0) {
     return [...new Set(existing)].sort();
   }
