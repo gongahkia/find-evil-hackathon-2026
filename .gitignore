@@ -11,6 +11,7 @@ packages/*/dist
 *.tsbuildinfo
 .playwright-cli
 .kelpclaw
+.kelpclaw/datasets/
 .env
 CLAUDE.md
 AGENTS.md
